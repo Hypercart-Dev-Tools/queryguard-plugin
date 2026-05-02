@@ -150,9 +150,21 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 			if ( defined( 'WP_CLI' ) && WP_CLI ) {
 				return 'wp_cli';
 			}
-			if ( did_action( 'action_scheduler_before_process_queue' ) ) {
+
+			// Action Scheduler must be detected before wp_doing_cron() and
+			// wp_doing_ajax() because both AS transports masquerade as those
+			// contexts at init priority 1 (before AS hooks have fired). Once
+			// apply_session_timeout's static memo caches the wrong tier, AS
+			// can't recover the unlimited ceiling later in the run.
+			$action = isset( $_REQUEST['action'] ) ? (string) $_REQUEST['action'] : '';
+			if (
+				did_action( 'action_scheduler_before_process_queue' ) ||
+				'as_async_request_queue_runner' === $action ||
+				( wp_doing_cron() && 'action_scheduler_run_queue' === $action )
+			) {
 				return 'action_scheduler';
 			}
+
 			if ( wp_doing_cron() ) {
 				return 'wp_cron';
 			}
