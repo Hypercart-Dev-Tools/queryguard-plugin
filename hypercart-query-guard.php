@@ -93,6 +93,12 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				add_action( 'admin_init', array( __CLASS__, 'apply_session_timeout' ), 1 );
 
 				// Catch the kill, log it, and surface a recovery notice in admin.
+				// The 'query' filter fires before each subsequent query, so we
+				// can capture the previous query's error before wpdb::flush()
+				// clears it. Without this, multiple kills in one request would
+				// collapse into a single log line (the last one). Shutdown is
+				// the fallback for the final query of the request.
+				add_filter( 'query', array( __CLASS__, 'capture_pending_kill_filter' ), 1 );
 				add_action( 'shutdown', array( __CLASS__, 'detect_and_log_kill' ), 0 );
 				add_action( 'admin_notices', array( __CLASS__, 'render_admin_search_notice' ) );
 			}
@@ -254,15 +260,58 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		}
 
 		/**
-		 * After the request, inspect $wpdb->last_error for the kill signature
-		 * and emit a structured log line. Also stash a transient for admin UX.
+		 * High-water mark for the last query number we've already inspected
+		 * for a kill. wpdb::$num_queries is monotonic, so comparing against
+		 * it lets us distinguish "fresh error from a new query" from "stale
+		 * error we already logged" — even when two consecutive kills produce
+		 * the same error string, which the NoFraud thundering-herd pattern
+		 * does in practice.
+		 *
+		 * @var int
+		 */
+		private static $last_checked_query_num = -1;
+
+		/**
+		 * 'query' filter callback. Runs before each wpdb::query() executes;
+		 * at that point $wpdb->last_error still holds the error from the
+		 * previous query (wpdb::flush() clears it later in the same call,
+		 * after our filter has run). Pass-through.
+		 *
+		 * @param string $query
+		 * @return string
+		 */
+		public static function capture_pending_kill_filter( $query ) {
+			self::capture_pending_kill();
+			return $query;
+		}
+
+		/**
+		 * Shutdown callback. Catches the final query of the request, which
+		 * the 'query' filter never gets a chance to inspect (no subsequent
+		 * query exists to trigger it).
 		 */
 		public static function detect_and_log_kill() {
+			self::capture_pending_kill();
+		}
+
+		/**
+		 * Inspect $wpdb->last_error for the kill signature and emit a
+		 * structured log line. Idempotent within a request: tracks
+		 * $wpdb->num_queries to avoid logging the same kill twice when
+		 * called from both the 'query' filter and the shutdown action.
+		 */
+		private static function capture_pending_kill() {
 			global $wpdb;
 
 			if ( empty( $wpdb ) || empty( $wpdb->last_error ) ) {
 				return;
 			}
+
+			$num = isset( $wpdb->num_queries ) ? (int) $wpdb->num_queries : 0;
+			if ( $num <= self::$last_checked_query_num ) {
+				return;
+			}
+			self::$last_checked_query_num = $num;
 
 			$err = $wpdb->last_error;
 			if (
