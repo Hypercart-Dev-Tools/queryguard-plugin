@@ -147,8 +147,15 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 			if ( self::MODE_OBSERVE !== $mode ) {
 				return false;
 			}
-			// Avoid wp_rand here — it's not loaded this early.
-			return ( mt_rand( 1, 100 ) <= self::OBSERVE_SAMPLE_PCT );
+			// Avoid wp_rand here — it's not loaded this early. random_int is
+			// PHP 7+ core; the catch is paranoia for environments without an
+			// entropy source (where it's the only built-in that throws).
+			try {
+				$roll = random_int( 1, 100 );
+			} catch ( Exception $e ) {
+				$roll = mt_rand( 1, 100 );
+			}
+			return ( $roll <= self::OBSERVE_SAMPLE_PCT );
 		}
 
 		/**
