@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- **Phase 1 Action Scheduler throttle modes.** Query Guard now supports a separate `HYPERCART_QUERY_GUARD_THROTTLE_MODE` with `off`, `test_observe`, `observe`, and `enforce` modes. The throttle hooks Action Scheduler's web queue runner and can reduce batch size, time limit, and concurrent batches under load without changing the existing MySQL query-kill rollout model.
+
+- **Managed-host-safe load detection and capability logging.** The throttle probes `Threads_running` opportunistically, falls back to due queue depth from `actionscheduler_actions`, logs probe latency and signal availability, and records `load_level_transition`, `as_throttle_capability_test`, `as_throttle_observed`, and `as_throttle_applied` events for rollout analysis.
+
+- **Cross-request hysteresis state for throttle decisions.** The throttle persists the last load level and transition timestamp using the best available backend: persistent object cache first, APCu second, and a low-write WordPress option fallback last. This keeps `test_observe`/`observe`/`enforce` decisions from flapping between requests on hosts without Redis or Memcached.
+
 ### Fixed
 
 - **Action Scheduler workers no longer get the wrong execution-time ceiling.** `detect_context()` previously relied on `did_action('action_scheduler_before_process_queue')`, which has not yet fired at `init` priority 1 when `apply_session_timeout()` runs. Both AS transports were misclassified:
