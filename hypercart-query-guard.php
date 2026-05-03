@@ -15,9 +15,13 @@
  *                    Modes: 'off' | 'observe' | 'enforce' (default: 'observe')
  *
  * Future v2:         Move SET SESSION application to a wp-content/db.php drop-in
- *                    so autoloaded options preload + plugins_loaded paths are
- *                    also protected. v1 (this file) hooks 'init' priority 1,
- *                    which covers ~99% of request volume but misses early boot.
+ *                    so the autoloaded-options preload and everything on
+ *                    muplugins_loaded / plugins_loaded / setup_theme is also
+ *                    protected. v1 (this file) hooks 'init' priority 1, so
+ *                    queries fired before then — wp_load_alloptions(),
+ *                    auth/usermeta lookups, WC session bootstrap — run
+ *                    without a ceiling. See README "Limitations and caveats"
+ *                    for signals that indicate v2 is needed.
  *
  * @package Hypercart
  */

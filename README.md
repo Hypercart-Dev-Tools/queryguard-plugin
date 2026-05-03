@@ -83,7 +83,13 @@ Two event types:
 
 ## Limitations and caveats
 
-- **`init` priority 1 is not the earliest possible hook.** Anything running on `plugins_loaded` or `setup_theme` (notably WooCommerce session bootstrap and the autoloaded options preload) executes before the `SET SESSION` is applied. For full coverage, the v2 path is a `wp-content/db.php` drop-in that sets the limit at connection time. v1 (this plugin) covers ~99% of request volume.
+- **`init` priority 1 is not the earliest possible hook — early-boot queries are unprotected.** The `SET SESSION` is applied on `init` priority 1, so anything that queries the database before then runs without the ceiling. In practice the unprotected window contains:
+  - The autoloaded options preload (`wp_load_alloptions()`) — a single `SELECT … FROM wp_options WHERE autoload = 'yes'`. Slow only on sites with bloated `wp_options` (10k+ autoloaded rows from plugins that never clean up).
+  - User and usermeta lookups during auth (`determine_current_user`, `wp_validate_auth_cookie`).
+  - WooCommerce session bootstrap on `plugins_loaded` priority 10 (`WC_Session_Handler::init`), which can hit `wp_woocommerce_sessions` and `wp_actionscheduler_*`.
+  - Anything plugins do on `muplugins_loaded`, `plugins_loaded`, or `setup_theme` — including object-cache warmup queries.
+
+  The v2 path that closes this gap is a `wp-content/db.php` drop-in that sets `MAX_EXECUTION_TIME` at connection time (inside `wpdb::db_connect()`), before the first query is possible. v1 covers everything from `init` onward, which empirically catches the failure modes this plugin was built for (admin search, REST polling, AJAX vectors, background sync). Signs you need v2: kills logged with `context: frontend` and a `last_query` against `wp_options`, repeated alloptions slow-query warnings in observe mode, or any kill whose stack trace points into `plugins_loaded`.
 - **`SAVEQUERIES` has memory cost.** Observe mode samples 5% of requests by default to keep overhead bounded. Don't run observe at 100% sampling on a high-traffic site.
 - **WP Engine reconnects.** WPE's MySQL proxy occasionally rotates connections mid-request. The static `$last_dbh` identity check detects this and re-applies the limit automatically.
 - **Older MySQL.** `MAX_EXECUTION_TIME` requires MySQL 5.7.8+ or Percona/MariaDB equivalents. The plugin suppresses errors on the `SET SESSION` itself, so an unsupported server fails open (no protection, no breakage).
