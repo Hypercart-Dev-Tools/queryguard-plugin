@@ -16,6 +16,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- **Throttle probes now fail closed on non-MySQL db drop-ins instead of fatalling on PHP 8+.** `run_mysqli_query()` previously assumed `$wpdb->dbh` was always a native `mysqli` handle when `mysqli_query()` existed. On sites using a custom `db.php` drop-in with a different connection type (for example SQLite or custom routing layers), passing that handle into `mysqli_query()` could throw a fatal `TypeError` on PHP 8+. The probe now verifies `instanceof mysqli` before calling any `mysqli_*` API and degrades to a logged probe error when the connection is not native MySQLi.
+
 - **Action Scheduler workers no longer get the wrong execution-time ceiling.** `detect_context()` previously relied on `did_action('action_scheduler_before_process_queue')`, which has not yet fired at `init` priority 1 when `apply_session_timeout()` runs. Both AS transports were misclassified:
   - The async-loopback path (`admin-ajax.php?action=as_async_request_queue_runner`) fell through to `admin_ajax` and got a 20s ceiling.
   - The WP-Cron path (`action_scheduler_run_queue`) fell through to `wp_cron` and got a 10s ceiling.

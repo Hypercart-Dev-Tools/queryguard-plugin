@@ -643,6 +643,17 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				);
 			}
 
+			// Some WordPress sites replace wpdb's native mysqli handle with a
+			// different connection type via a db.php drop-in. Passing a non-mysqli
+			// object/resource into mysqli_query() throws a fatal TypeError on PHP 8+.
+			if ( ! ( $wpdb->dbh instanceof mysqli ) ) {
+				return array(
+					'rows'  => null,
+					'ms'    => 0,
+					'error' => 'not_mysqli_connection',
+				);
+			}
+
 			$start  = microtime( true );
 			$result = @mysqli_query( $wpdb->dbh, $sql );
 			$ms     = (int) round( ( microtime( true ) - $start ) * 1000 );
