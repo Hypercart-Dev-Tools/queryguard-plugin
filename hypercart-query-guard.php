@@ -165,6 +165,13 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		private static $throttle_state_cache = null;
 
 		/**
+		 * Memoized throttle cache backend identifier for the current request.
+		 *
+		 * @var string|null
+		 */
+		private static $throttle_cache_backend = null;
+
+		/**
 		 * Bootstrap.
 		 */
 		public static function init() {
@@ -436,15 +443,19 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		 * @return string
 		 */
 		private static function get_throttle_cache_backend() {
+			if ( null !== self::$throttle_cache_backend ) {
+				return self::$throttle_cache_backend;
+			}
+
 			if ( function_exists( 'wp_using_ext_object_cache' ) && wp_using_ext_object_cache() ) {
-				return 'persistent_object_cache';
+				self::$throttle_cache_backend = 'persistent_object_cache';
+			} elseif ( self::is_apcu_available() ) {
+				self::$throttle_cache_backend = 'apcu';
+			} else {
+				self::$throttle_cache_backend = 'db_fallback';
 			}
 
-			if ( self::is_apcu_available() ) {
-				return 'apcu';
-			}
-
-			return 'db_fallback';
+			return self::$throttle_cache_backend;
 		}
 
 		/**
