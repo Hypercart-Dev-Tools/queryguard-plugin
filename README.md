@@ -11,6 +11,7 @@ Built for high-volume WooCommerce stores on managed hosts (WP Engine, Pressable,
 - Logs killed queries with their URI, calling user, and context for post-incident analysis.
 - Surfaces a recovery notice in `wp-admin` when an admin search is killed, so the user sees "Search timed out, try a more specific query" instead of a misleading "no results found" (which causes them to retry and re-trigger the runaway).
 - Ships a SAVEQUERIES-based observe mode for safe rollout: identifies queries that *would* be killed before you turn enforcement on.
+- Ships a Phase 1 Action Scheduler throttle with managed-host-safe `test_observe`, `observe`, and `enforce` modes so you can validate load signals before changing queue-runner behavior.
 
 ## What it does not do
 
@@ -34,6 +35,7 @@ Add to `wp-config.php`:
 
 ```php
 define( 'HYPERCART_QUERY_GUARD_MODE', 'observe' );
+define( 'HYPERCART_QUERY_GUARD_THROTTLE_MODE', 'off' );
 ```
 
 Modes:
@@ -41,6 +43,45 @@ Modes:
 - **`off`** — plugin loads but does nothing. Use to disable without uninstalling.
 - **`observe`** *(default)* — no `MAX_EXECUTION_TIME` set, no kills. Samples 5% of requests, logs queries that exceed 5 seconds. Safe to run in production for a week before flipping to enforce.
 - **`enforce`** — applies the tiered ceiling, kills runaway queries, logs every kill, and shows the admin recovery notice.
+
+Action Scheduler throttle modes:
+
+- **`off`** *(default)* — no load probing and no queue-runner throttling.
+- **`test_observe`** — probes load signals and logs capability / probe timing information during Action Scheduler runs without changing queue behavior. Start here on managed hosts.
+- **`observe`** — computes the effective throttle decision and logs what would happen, but does not alter queue-runner behavior.
+- **`enforce`** — applies the queue-runner throttle policy based on the detected load level.
+
+Throttle policy defaults:
+
+| Load | Batch Size | Time Limit | Concurrent Batches |
+| --- | ---: | ---: | ---: |
+| Normal | default | default | default |
+| Elevated | 5 | 15s | 1 |
+| Critical | 1 | 10s | 1 |
+
+Throttle tuning filters:
+
+```php
+add_filter( 'hypercart_query_guard_throttle_mode', function( $mode ) {
+	return $mode;
+} );
+
+add_filter( 'hypercart_query_guard_throttle_enabled', function( $enabled, $mode ) {
+	return $enabled;
+}, 10, 2 );
+
+add_filter( 'hypercart_query_guard_load_thresholds', function( $thresholds ) {
+	$thresholds['queue_depth_critical'] = 250;
+	return $thresholds;
+} );
+
+add_filter( 'hypercart_query_guard_throttle_policy', function( $policy ) {
+	$policy['critical']['time_limit'] = 8;
+	return $policy;
+} );
+
+add_filter( 'hypercart_query_guard_throttle_require_persistent_cache', '__return_true' );
+```
 
 ## Tiered limits
 
@@ -76,17 +117,31 @@ If `Hypercart_Logger` (from the Hypercart Performance Monitor plugin) is present
 [hypercart_query_guard][error] {"event":"query_killed","context":"admin_ajax","limit_ms":20000,"last_query":"SELECT * FROM wp_nf_transactions WHERE meta_key = '_nofraud_transaction_status_workaround'","uri":"/wp-admin/admin-ajax.php","user_id":0,"time":1745875234}
 ```
 
-Two event types:
+Event types:
 
 - **`slow_query`** *(warn)* — query exceeded 5s but completed; sampled in observe mode, always in enforce mode.
 - **`query_killed`** *(error)* — MySQL killed the query for hitting the limit; only emitted in enforce mode.
+- **`as_throttle_capability_test`** *(info)* — emitted in `test_observe`; includes signal availability, cache backend, and probe timing.
+- **`as_throttle_observed`** *(info)* — emitted in throttle `observe`; logs the would-be Action Scheduler throttle decision.
+- **`as_throttle_applied`** *(info)* — emitted in throttle `enforce`; logs the effective Action Scheduler throttle decision.
+- **`load_level_transition`** *(info)* — emitted when the throttle load level changes across requests.
 
 ## Limitations and caveats
 
-- **`init` priority 1 is not the earliest possible hook.** Anything running on `plugins_loaded` or `setup_theme` (notably WooCommerce session bootstrap and the autoloaded options preload) executes before the `SET SESSION` is applied. For full coverage, the v2 path is a `wp-content/db.php` drop-in that sets the limit at connection time. v1 (this plugin) covers ~99% of request volume.
+- **`init` priority 1 is not the earliest possible hook — early-boot queries are unprotected.** The `SET SESSION` is applied on `init` priority 1, so anything that queries the database before then runs without the ceiling. In practice the unprotected window contains:
+  - The autoloaded options preload (`wp_load_alloptions()`) — a single `SELECT … FROM wp_options WHERE autoload = 'yes'`. Slow only on sites with bloated `wp_options` (10k+ autoloaded rows from plugins that never clean up).
+  - User and usermeta lookups during auth (`determine_current_user`, `wp_validate_auth_cookie`).
+  - WooCommerce session bootstrap on `plugins_loaded` priority 10 (`WC_Session_Handler::init`), which can hit `wp_woocommerce_sessions` and `wp_actionscheduler_*`.
+  - Anything plugins do on `muplugins_loaded`, `plugins_loaded`, or `setup_theme` — including object-cache warmup queries.
+
+  The v2 path that closes this gap is a `wp-content/db.php` drop-in that sets `MAX_EXECUTION_TIME` at connection time (inside `wpdb::db_connect()`), before the first query is possible. v1 covers everything from `init` onward, which empirically catches the failure modes this plugin was built for (admin search, REST polling, AJAX vectors, background sync). Signs you need v2: kills logged with `context: frontend` and a `last_query` against `wp_options`, repeated alloptions slow-query warnings in observe mode, or any kill whose stack trace points into `plugins_loaded`.
 - **`SAVEQUERIES` has memory cost.** Observe mode samples 5% of requests by default to keep overhead bounded. Don't run observe at 100% sampling on a high-traffic site.
 - **WP Engine reconnects.** WPE's MySQL proxy occasionally rotates connections mid-request. The static `$last_dbh` identity check detects this and re-applies the limit automatically.
 - **Older MySQL.** `MAX_EXECUTION_TIME` requires MySQL 5.7.8+ or Percona/MariaDB equivalents. The plugin suppresses errors on the `SET SESSION` itself, so an unsupported server fails open (no protection, no breakage).
+- **Managed-host throttling relies heavily on queue depth.** `SHOW STATUS LIKE 'Threads_running'` is often blocked on WP Engine, Kinsta, and similar platforms, so the Action Scheduler throttle treats queue depth as the practical primary signal and logs whether `Threads_running` was available.
+- **Throttle hysteresis needs cross-request state.** The plugin prefers a persistent object cache, falls back to APCu, and finally falls back to a low-write WordPress option storing only the current level and last transition timestamp.
+- **WP-CLI queue runs are only partially covered by the Phase 1 throttle.** Action Scheduler's WP-CLI runner takes its batch size from the CLI command arguments, not the `action_scheduler_queue_runner_batch_size` filter, so web-runner throttling and CLI-runner throttling are not identical.
+- **Benchmark the queue-depth probe on large stores before enforce.** The due-queue-depth probe is cheap on a healthy `actionscheduler_actions` index, but it is still a real SQL query. Use `test_observe` first and inspect the logged probe timings before enabling `enforce`.
 
 ## Origin
 
