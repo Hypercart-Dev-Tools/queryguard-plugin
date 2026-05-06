@@ -21,10 +21,12 @@ Built for high-volume WooCommerce stores on managed hosts (WP Engine, Pressable,
 
 ## Installation
 
-Drop the file into `wp-content/mu-plugins/`:
+Copy all plugin PHP files into `wp-content/mu-plugins/`:
 
-```
+```text
 wp-content/mu-plugins/hypercart-query-guard.php
+wp-content/mu-plugins/class-hcqg-load-monitor.php
+wp-content/mu-plugins/class-hcqg-priority-registry.php
 ```
 
 No activation step. MU-plugins load automatically.

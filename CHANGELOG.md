@@ -14,6 +14,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - **Cross-request hysteresis state for throttle decisions.** The throttle persists the last load level and transition timestamp using the best available backend: persistent object cache first, APCu second, and a low-write WordPress option fallback last. This keeps `test_observe`/`observe`/`enforce` decisions from flapping between requests on hosts without Redis or Memcached.
 
+- **Wave A class extraction.** Load probing, hysteresis, and cross-request state persistence now live in `class-hcqg-load-monitor.php`, and the default per-hook priority map for future per-action throttling now lives in `class-hcqg-priority-registry.php`. The priority registry ships inert until Wave B.
+
 ### Fixed
 
 - **Throttle probes now fail closed on non-MySQL db drop-ins instead of fatalling on PHP 8+.** `run_mysqli_query()` previously assumed `$wpdb->dbh` was always a native `mysqli` handle when `mysqli_query()` existed. On sites using a custom `db.php` drop-in with a different connection type (for example SQLite or custom routing layers), passing that handle into `mysqli_query()` could throw a fatal `TypeError` on PHP 8+. The probe now verifies `instanceof mysqli` before calling any `mysqli_*` API and degrades to a logged probe error when the connection is not native MySQLi.
