@@ -1,5 +1,15 @@
 # P1: Priority-Based Concurrency Control for Action Scheduler
 
+> **Status: Completed** (moved to `3-DONE/` on 2026-05-06).
+>
+> | Original phase | Shipped as | PR |
+> | --- | --- | --- |
+> | Phase 1 — Load-Aware Queue Throttling | Wave A | [#25](https://github.com/Hypercart-Dev-Tools/queryguard-plugin/pull/25) |
+> | Phase 2 — Priority-Based Deferral | Wave B | [#26](https://github.com/Hypercart-Dev-Tools/queryguard-plugin/pull/26) |
+> | Phase 3 — Mutex Guard | Carved out into a separate design doc → [PROJECT/2-WORKING/P1-MUTEX-GUARD.md](../2-WORKING/P1-MUTEX-GUARD.md) (still in design) |
+>
+> See [ARCHITECTURE.md](../../ARCHITECTURE.md) for the as-built design and [CHANGELOG.md](../../CHANGELOG.md) for the shipped behavior. The Phase 3 working doc supersedes this one for any future Mutex Guard work.
+
 ## Context
 
 Issue: `Hypercart-Dev-Tools/queryguard-plugin#3`
