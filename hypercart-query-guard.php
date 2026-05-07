@@ -173,7 +173,12 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				add_filter( 'action_scheduler_queue_runner_batch_size', array( __CLASS__, 'filter_queue_runner_batch_size' ), 99 );
 				add_filter( 'action_scheduler_queue_runner_time_limit', array( __CLASS__, 'filter_queue_runner_time_limit' ), 99 );
 				add_filter( 'action_scheduler_queue_runner_concurrent_batches', array( __CLASS__, 'filter_queue_runner_concurrent_batches' ), 99 );
-				add_action( 'action_scheduler_before_execute', array( __CLASS__, 'maybe_defer_action_before_execute' ), 1, 2 );
+
+				// before_execute does per-action DB work; test_observe is a
+				// capability probe and must not pay that cost.
+				if ( self::THROTTLE_MODE_TEST_OBSERVE !== $throttle_mode ) {
+					add_action( 'action_scheduler_before_execute', array( __CLASS__, 'maybe_defer_action_before_execute' ), 1, 2 );
+				}
 			}
 
 			// Apply the SET SESSION early. Priority 1 on 'init' is as early as
@@ -321,12 +326,46 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				return;
 			}
 
+			$args        = isset( $action_decision['args'] ) ? $action_decision['args'] : array();
+			$max_defers  = (int) apply_filters( 'hypercart_query_guard_max_defer_count', 5 );
+			$defer_count = self::get_defer_count( $action_decision['hook'], $args, $action_decision['group'] );
+			if ( $max_defers > 0 && $defer_count >= $max_defers ) {
+				self::log(
+					'info',
+					array(
+						'event'         => 'as_action_deferral_skipped',
+						'reason'        => 'max_defers_reached',
+						'action_id'     => (int) $action_id,
+						'hook'          => $action_decision['hook'],
+						'group'         => $action_decision['group'],
+						'priority_tier' => $action_decision['priority_tier'],
+						'defer_count'   => $defer_count,
+						'max'           => $max_defers,
+						'load_level'    => $decision['level'],
+					)
+				);
+				return;
+			}
+
 			$rescheduled_action_id = 0;
 			if ( self::THROTTLE_MODE_ENFORCE === $decision['effective_mode'] ) {
 				$rescheduled_action_id = self::defer_action( (int) $action_id, $action_decision );
 				if ( $rescheduled_action_id <= 0 ) {
 					return;
 				}
+				self::increment_defer_count( $action_decision['hook'], $args, $action_decision['group'] );
+			}
+
+			// Dedupe per (hook, level) per request to bound log volume during
+			// sustained load. Enforce mode emits one record per actual defer
+			// because state changed and we want the audit trail; observe mode
+			// is just a forecast and one line per hook is enough.
+			if ( self::THROTTLE_MODE_OBSERVE === $decision['effective_mode'] ) {
+				$dedup_key = $action_decision['hook'] . '@' . $decision['level'];
+				if ( ! empty( self::$throttle_runtime['observed_defer_keys'][ $dedup_key ] ) ) {
+					return;
+				}
+				self::$throttle_runtime['observed_defer_keys'][ $dedup_key ] = true;
 			}
 
 			self::log(
@@ -339,6 +378,7 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 					'group'                => $action_decision['group'],
 					'priority_tier'        => $action_decision['priority_tier'],
 					'delay_seconds'        => $action_decision['delay_seconds'],
+					'defer_count'          => $defer_count,
 					'requested_mode'       => $decision['requested_mode'],
 					'effective_mode'       => $decision['effective_mode'],
 					'load_level'           => $decision['level'],
@@ -441,6 +481,15 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		/**
 		 * Default per-action delay matrix, filterable per store.
 		 *
+		 * Filter contract for `hypercart_query_guard_action_delay_matrix`:
+		 *   - Cells are addressed by (load_level, priority_tier). Levels are
+		 *     fixed (`elevated`, `critical`); tiers come from the canonical
+		 *     HCQG_Priority_Registry::TIERS. Filters can only override
+		 *     existing cells — unknown level keys, unknown tier keys, and
+		 *     non-array level values are silently ignored.
+		 *   - Values are clamped to non-negative integer seconds. Set a cell
+		 *     to 0 to mean "run immediately" for that (level, tier) pair.
+		 *
 		 * @return array<string,array<string,int>>
 		 */
 		private static function get_action_delay_matrix() {
@@ -506,17 +555,39 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 
 			$hook          = (string) $action->get_hook();
 			$group         = (string) $action->get_group();
+			$args          = (array) $action->get_args();
 			$priority_tier = HCQG_Priority_Registry::get_priority( $hook );
+
+			// Recurring schedules: do not interfere. Cancelling a recurring
+			// instance breaks AS's recurrence chain (schedule_next_instance
+			// only runs on a successful execution path), and re-rooting the
+			// chain at now+delay silently shifts the cadence — for cron
+			// schedules in particular, an entire scheduled tick can be missed.
+			$schedule = $action->get_schedule();
+			if ( method_exists( $schedule, 'is_recurring' ) && $schedule->is_recurring() ) {
+				return array(
+					'should_defer'  => false,
+					'reason'        => 'recurring_schedule',
+					'action'        => $action,
+					'action_id'     => (int) $action_id,
+					'hook'          => $hook,
+					'group'         => $group,
+					'args'          => $args,
+					'priority_tier' => $priority_tier,
+				);
+			}
+
 			$delay_seconds = self::get_action_delay_seconds( $decision['level'], $priority_tier );
 
 			return array(
-				'should_defer'  => $delay_seconds > 0,
-				'action'        => $action,
-				'action_id'     => (int) $action_id,
-				'hook'          => $hook,
-				'group'         => $group,
-				'priority_tier' => $priority_tier,
-				'delay_seconds' => $delay_seconds,
+				'should_defer'   => $delay_seconds > 0,
+				'action'         => $action,
+				'action_id'      => (int) $action_id,
+				'hook'           => $hook,
+				'group'          => $group,
+				'args'           => $args,
+				'priority_tier'  => $priority_tier,
+				'delay_seconds'  => $delay_seconds,
 				'runner_context' => $runner_context,
 			);
 		}
@@ -553,6 +624,16 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				$new_action = self::build_deferred_action_clone( $action, (int) $action_decision['delay_seconds'] );
 				$new_id     = (int) $store->save_action( $new_action );
 				if ( $new_id <= 0 ) {
+					self::log(
+						'warn',
+						array(
+							'event'         => 'as_action_defer_failed',
+							'reason'        => 'save_returned_zero',
+							'action_id'     => (int) $action_id,
+							'hook'          => isset( $action_decision['hook'] ) ? $action_decision['hook'] : '',
+							'delay_seconds' => isset( $action_decision['delay_seconds'] ) ? (int) $action_decision['delay_seconds'] : 0,
+						)
+					);
 					return 0;
 				}
 
@@ -565,6 +646,7 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 					'warn',
 					array(
 						'event'         => 'as_action_defer_failed',
+						'reason'        => 'exception',
 						'action_id'     => (int) $action_id,
 						'hook'          => isset( $action_decision['hook'] ) ? $action_decision['hook'] : '',
 						'delay_seconds' => isset( $action_decision['delay_seconds'] ) ? (int) $action_decision['delay_seconds'] : 0,
@@ -577,30 +659,20 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		}
 
 		/**
-		 * Clone an existing scheduled action with a delayed next run.
+		 * Clone a non-recurring scheduled action with a delayed next run.
 		 *
-		 * Recurring schedules keep their recurrence metadata; async and single
-		 * actions are converted to a delayed single-run schedule.
+		 * Recurring schedules are filtered out upstream in
+		 * get_action_throttle_decision() because cancelling a recurring
+		 * instance breaks the recurrence chain; this builder only handles
+		 * single-shot / async actions.
 		 *
 		 * @param ActionScheduler_Action $action
 		 * @param int                    $delay_seconds
 		 * @return ActionScheduler_Action
-		 * @throws Exception When the schedule type cannot be deferred safely.
 		 */
 		private static function build_deferred_action_clone( ActionScheduler_Action $action, $delay_seconds ) {
-			$run_at   = as_get_datetime_object( time() + max( 0, (int) $delay_seconds ) );
-			$schedule = $action->get_schedule();
-
-			if ( method_exists( $schedule, 'is_recurring' ) && $schedule->is_recurring() ) {
-				$schedule_class = get_class( $schedule );
-				if ( ! in_array( $schedule_class, array( 'ActionScheduler_IntervalSchedule', 'ActionScheduler_CronSchedule' ), true ) ) {
-					throw new Exception( 'unsupported_recurring_schedule' );
-				}
-
-				$new_schedule = new $schedule_class( $run_at, $schedule->get_recurrence(), $schedule->get_first_date() );
-			} else {
-				$new_schedule = new ActionScheduler_SimpleSchedule( $run_at );
-			}
+			$run_at       = as_get_datetime_object( time() + max( 0, (int) $delay_seconds ) );
+			$new_schedule = new ActionScheduler_SimpleSchedule( $run_at );
 
 			$new_action = new ActionScheduler_Action(
 				$action->get_hook(),
@@ -608,9 +680,41 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				$new_schedule,
 				$action->get_group()
 			);
-			$new_action->set_priority( $action->get_priority() );
+
+			// Action priority API was added in AS 3.7.0; older WooCommerce
+			// installs ship pre-3.7 AS. Guard the calls so we don't fatal.
+			if ( method_exists( $action, 'get_priority' ) && method_exists( $new_action, 'set_priority' ) ) {
+				$new_action->set_priority( $action->get_priority() );
+			}
 
 			return $new_action;
+		}
+
+		/**
+		 * Per-action defer-count helpers. Cap deferrals per (hook, args, group)
+		 * so a deferrable action under sustained critical load eventually runs
+		 * instead of starving indefinitely. Backed by the object cache; on
+		 * hosts without persistent caching the counter resets per request,
+		 * which is fine — the cap is best-effort, not a hard guarantee.
+		 */
+		const DEFER_COUNT_TTL          = 3600;
+		const DEFER_COUNT_KEY_PREFIX   = 'defer_count_';
+
+		private static function defer_count_key( $hook, array $args, $group ) {
+			$encoded = function_exists( 'wp_json_encode' ) ? wp_json_encode( $args ) : json_encode( $args );
+			$hash    = hash( 'crc32', $hook . '|' . (string) $group . '|' . (string) $encoded );
+			return self::DEFER_COUNT_KEY_PREFIX . $hash;
+		}
+
+		private static function get_defer_count( $hook, array $args, $group ) {
+			return (int) wp_cache_get( self::defer_count_key( $hook, $args, $group ), HCQG_Load_Monitor::CACHE_GROUP );
+		}
+
+		private static function increment_defer_count( $hook, array $args, $group ) {
+			$key   = self::defer_count_key( $hook, $args, $group );
+			$count = (int) wp_cache_get( $key, HCQG_Load_Monitor::CACHE_GROUP ) + 1;
+			wp_cache_set( $key, $count, HCQG_Load_Monitor::CACHE_GROUP, self::DEFER_COUNT_TTL );
+			return $count;
 		}
 
 		/**
