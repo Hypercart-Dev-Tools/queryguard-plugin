@@ -22,6 +22,17 @@ if ( ! class_exists( 'HCQG_Priority_Registry' ) ) {
 		const TIER_DEFERRABLE = 'deferrable';
 
 		/**
+		 * Canonical tier order. First match wins in get_priority(); filters
+		 * cannot add new tiers or reorder these.
+		 */
+		const TIERS = array(
+			self::TIER_CRITICAL,
+			self::TIER_HIGH,
+			self::TIER_NORMAL,
+			self::TIER_DEFERRABLE,
+		);
+
+		/**
 		 * Default hook-pattern registry.
 		 */
 		const DEFAULT_REGISTRY = array(
@@ -49,22 +60,31 @@ if ( ! class_exists( 'HCQG_Priority_Registry' ) ) {
 		);
 
 		/**
-		 * Get the filterable default registry.
+		 * Get the filterable registry.
+		 *
+		 * Filter contract for `hypercart_query_guard_priority_registry`:
+		 *   - Tiers are fixed (see self::TIERS) and always evaluated in
+		 *     critical → high → normal → deferrable order. Filters cannot add
+		 *     new tiers or change ordering; unknown tier keys are dropped.
+		 *   - For each tier, return an array of patterns to override the
+		 *     defaults, or an empty array to clear them. Omitted tiers inherit
+		 *     defaults — to clear a tier you must explicitly pass an empty
+		 *     array (e.g. `'critical' => array()`).
 		 *
 		 * @return array<string,array<int,string>>
 		 */
 		public static function get_registry() {
-			$registry = apply_filters( 'hypercart_query_guard_priority_registry', self::DEFAULT_REGISTRY );
-			if ( ! is_array( $registry ) ) {
-				return self::DEFAULT_REGISTRY;
+			$filtered = apply_filters( 'hypercart_query_guard_priority_registry', self::DEFAULT_REGISTRY );
+			if ( ! is_array( $filtered ) ) {
+				$filtered = self::DEFAULT_REGISTRY;
 			}
 
-			$normalized = array();
-			foreach ( $registry as $tier => $patterns ) {
-				if ( ! is_array( $patterns ) ) {
-					continue;
-				}
-				$normalized[ (string) $tier ] = array_values(
+			$registry = array();
+			foreach ( self::TIERS as $tier ) {
+				$patterns = ( array_key_exists( $tier, $filtered ) && is_array( $filtered[ $tier ] ) )
+					? $filtered[ $tier ]
+					: self::DEFAULT_REGISTRY[ $tier ];
+				$registry[ $tier ] = array_values(
 					array_filter(
 						array_map( 'strval', $patterns ),
 						'strlen'
@@ -72,13 +92,18 @@ if ( ! class_exists( 'HCQG_Priority_Registry' ) ) {
 				);
 			}
 
-			return array_merge( self::DEFAULT_REGISTRY, $normalized );
+			return $registry;
 		}
 
 		/**
 		 * Resolve a hook name to a priority tier.
 		 *
 		 * This registry is inert until Wave B wires it into throttle decisions.
+		 *
+		 * The `hypercart_query_guard_action_priority` filter may override the
+		 * resolved tier, but its return value MUST be one of self::TIERS;
+		 * unknown tier strings are ignored and the registry-resolved tier is
+		 * returned instead.
 		 *
 		 * @param string $hook_name
 		 * @return string
@@ -96,7 +121,11 @@ if ( ! class_exists( 'HCQG_Priority_Registry' ) ) {
 				}
 			}
 
-			return (string) apply_filters( 'hypercart_query_guard_action_priority', $priority, $hook_name );
+			$filtered = apply_filters( 'hypercart_query_guard_action_priority', $priority, $hook_name );
+			if ( is_string( $filtered ) && in_array( $filtered, self::TIERS, true ) ) {
+				return $filtered;
+			}
+			return $priority;
 		}
 
 		/**
