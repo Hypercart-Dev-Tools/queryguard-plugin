@@ -53,6 +53,13 @@ Action Scheduler throttle modes:
 - **`observe`** — computes the effective throttle decision and logs what would happen, but does not alter queue-runner behavior.
 - **`enforce`** — applies the queue-runner throttle policy based on the detected load level.
 
+Wave B per-action deferral defaults:
+
+| Load | Critical | High | Normal | Deferrable |
+| --- | ---: | ---: | ---: | ---: |
+| Elevated | run | run | +5 min | +15 min |
+| Critical | run | +5 min | +15 min | +60 min |
+
 Throttle policy defaults:
 
 | Load | Batch Size | Time Limit | Concurrent Batches |
@@ -80,6 +87,11 @@ add_filter( 'hypercart_query_guard_load_thresholds', function( $thresholds ) {
 add_filter( 'hypercart_query_guard_throttle_policy', function( $policy ) {
 	$policy['critical']['time_limit'] = 8;
 	return $policy;
+} );
+
+add_filter( 'hypercart_query_guard_action_delay_matrix', function( $matrix ) {
+	$matrix['critical']['deferrable'] = 1800;
+	return $matrix;
 } );
 
 add_filter( 'hypercart_query_guard_throttle_require_persistent_cache', '__return_true' );
@@ -126,6 +138,9 @@ Event types:
 - **`as_throttle_capability_test`** *(info)* — emitted in `test_observe`; includes signal availability, cache backend, and probe timing.
 - **`as_throttle_observed`** *(info)* — emitted in throttle `observe`; logs the would-be Action Scheduler throttle decision.
 - **`as_throttle_applied`** *(info)* — emitted in throttle `enforce`; logs the effective Action Scheduler throttle decision.
+- **`as_action_deferred`** *(info)* — emitted when an individual Action Scheduler job is deferred by priority tier and load level. In `observe` mode, deduped per (hook, level) per request to bound log volume during sustained load.
+- **`as_action_deferral_skipped`** *(info)* — emitted when a defer is suppressed: `reason: max_defers_reached` after the per-(hook, args, group) defer cap is hit, or recurring schedules that the throttle refuses to interfere with.
+- **`as_action_defer_failed`** *(warn)* — emitted when `save_action()` returns 0 or throws while creating the deferred clone.
 - **`load_level_transition`** *(info)* — emitted when the throttle load level changes across requests.
 
 ## Limitations and caveats
@@ -143,6 +158,10 @@ Event types:
 - **Managed-host throttling relies heavily on queue depth.** `SHOW STATUS LIKE 'Threads_running'` is often blocked on WP Engine, Kinsta, and similar platforms, so the Action Scheduler throttle treats queue depth as the practical primary signal and logs whether `Threads_running` was available.
 - **Throttle hysteresis needs cross-request state.** The plugin prefers a persistent object cache, falls back to APCu, and finally falls back to a low-write WordPress option storing only the current level and last transition timestamp.
 - **WP-CLI queue runs are only partially covered by the Phase 1 throttle.** Action Scheduler's WP-CLI runner takes its batch size from the CLI command arguments, not the `action_scheduler_queue_runner_batch_size` filter, so web-runner throttling and CLI-runner throttling are not identical.
+- **Wave B currently defers before execution, not before claim.** Deferred actions are rescheduled and the current claimed action is canceled/unclaimed in `action_scheduler_before_execute`. That keeps the expensive callback from running, but it does not remove all claim churn under load.
+- **Wave B does not defer recurring actions.** Cancelling a recurring instance breaks Action Scheduler's recurrence chain (the chain advances only on a successful execution path), and re-rooting a new chain at `now+delay` silently shifts the cadence — for cron schedules, an entire scheduled tick can be missed. The throttle leaves recurring actions alone; consider using `action_scheduler_queue_runner_concurrent_batches` and the Wave A queue-runner throttle to shed recurring load instead.
+- **Wave B caps deferrals per action signature.** A given (hook, args, group) is deferred at most 5 times within a 1-hour window before the throttle lets it run. Filter `hypercart_query_guard_max_defer_count` to tune. The cap is best-effort — counters live in the object cache and reset per request on hosts without a persistent cache.
+- **Each defer creates a new `wp_actionscheduler_actions` row.** The original is canceled, the deferred clone is pending in the future. Under sustained critical load this can grow the canceled-row population materially before AS pruning catches up. Monitor `wp_actionscheduler_actions` row counts during enforce-mode rollouts.
 - **Benchmark the queue-depth probe on large stores before enforce.** The due-queue-depth probe is cheap on a healthy `actionscheduler_actions` index, but it is still a real SQL query. Use `test_observe` first and inspect the logged probe timings before enabling `enforce`.
 
 ## Origin
