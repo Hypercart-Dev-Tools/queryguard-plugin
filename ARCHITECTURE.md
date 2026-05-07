@@ -157,7 +157,7 @@ The two registry filters use **extend-not-replace** semantics: omitted tiers / c
 
 ## Logging
 
-All structured records go through `Hypercart_Query_Guard::log()`, which prefers `Hypercart_Logger` if present (the file-based logger from the Performance Monitor plugin) and falls back to `error_log()` with single-line JSON for grep-ability. Every record carries an `event` field; the full event vocabulary is documented in [README.md](README.md#observing-the-throttle).
+All structured records go through `Hypercart_Query_Guard::log()`, which prefers `Hypercart_Logger` if present (the file-based logger from the Performance Monitor plugin) and falls back to `error_log()` with single-line JSON for grep-ability. Every record carries an `event` field; the full event vocabulary is documented in [README.md](README.md#logging).
 
 ## Testing model
 

@@ -164,6 +164,10 @@ Event types:
 - **Each defer creates a new `wp_actionscheduler_actions` row.** The original is canceled, the deferred clone is pending in the future. Under sustained critical load this can grow the canceled-row population materially before AS pruning catches up. Monitor `wp_actionscheduler_actions` row counts during enforce-mode rollouts.
 - **Benchmark the queue-depth probe on large stores before enforce.** The due-queue-depth probe is cheap on a healthy `actionscheduler_actions` index, but it is still a real SQL query. Use `test_observe` first and inspect the logged probe timings before enabling `enforce`.
 
+## Architecture
+
+For an engineering-level overview of how the plugin is put together — subsystem boundaries, the throttle decision pipeline, cross-request state model, mode matrix, public filter surface, and the testing approach — see [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Origin
 
 Built in response to a CPU-saturation incident on a high-volume WooCommerce store where a single Facebook background sync query (`SELECT … FROM wp_comments WHERE comment_ID IN (… 10,010 items …)`) running concurrently with itself took down the whole pod. The kill switch is the cheapest insurance against that class of failure: a few hours of work, indefinite payoff.
