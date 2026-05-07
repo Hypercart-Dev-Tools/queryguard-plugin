@@ -9,7 +9,8 @@
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
  * Requires PHP:      7.4
  *
- * Drop in:           wp-content/mu-plugins/hypercart-query-guard.php
+ * Drop in:           Copy this file plus class-hcqg-*.php into
+ *                    wp-content/mu-plugins/
  *
  * Mode control:      define( 'HYPERCART_QUERY_GUARD_MODE', 'observe' );
  *                    Modes: 'off' | 'observe' | 'enforce' (default: 'observe')
@@ -33,6 +34,9 @@
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
+
+require_once __DIR__ . '/class-hcqg-load-monitor.php';
+require_once __DIR__ . '/class-hcqg-priority-registry.php';
 
 if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 
@@ -59,29 +63,6 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		const THROTTLE_LEVEL_NORMAL   = 'normal';
 		const THROTTLE_LEVEL_ELEVATED = 'elevated';
 		const THROTTLE_LEVEL_CRITICAL = 'critical';
-
-		/**
-		 * State storage for throttle hysteresis.
-		 */
-		const THROTTLE_STATE_OPTION = 'hcqg_throttle_state';
-		const THROTTLE_CACHE_GROUP  = 'hypercart_query_guard';
-		const THROTTLE_CACHE_KEY    = 'throttle_state';
-
-		/**
-		 * Default throttle thresholds.
-		 */
-		const THROTTLE_THRESHOLDS = array(
-			'cache_ttl_seconds'             => 5,
-			'level_min_dwell_seconds'       => 30,
-			'threads_running_elevated'      => 5,
-			'threads_running_critical'      => 15,
-			'threads_running_elevated_exit' => 3,
-			'threads_running_critical_exit' => 10,
-			'queue_depth_elevated'          => 100,
-			'queue_depth_critical'          => 500,
-			'queue_depth_elevated_exit'     => 50,
-			'queue_depth_critical_exit'     => 250,
-		);
 
 		/**
 		 * Default throttle policy by load level.
@@ -156,20 +137,6 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		 * @var array<string,mixed>
 		 */
 		private static $throttle_runtime = array();
-
-		/**
-		 * Cached persisted throttle state.
-		 *
-		 * @var array<string,mixed>|null
-		 */
-		private static $throttle_state_cache = null;
-
-		/**
-		 * Memoized throttle cache backend identifier for the current request.
-		 *
-		 * @var string|null
-		 */
-		private static $throttle_cache_backend = null;
 
 		/**
 		 * Bootstrap.
@@ -326,14 +293,14 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 			}
 
 			$requested_mode = self::get_throttle_mode();
-			$thresholds     = self::get_throttle_thresholds();
-			$cache_backend  = self::get_throttle_cache_backend();
+			$thresholds     = HCQG_Load_Monitor::get_thresholds();
+			$cache_backend  = HCQG_Load_Monitor::get_cache_backend();
 			$effective_mode = self::get_effective_throttle_mode( $requested_mode, $cache_backend );
-			$metrics        = self::collect_throttle_metrics();
-			$state          = self::read_throttle_state();
+			$metrics        = HCQG_Load_Monitor::collect_metrics();
+			$state          = HCQG_Load_Monitor::read_state();
 			$previous_level = isset( $state['level'] ) ? (string) $state['level'] : self::THROTTLE_LEVEL_NORMAL;
 			$previous_at    = isset( $state['changed_at'] ) ? (int) $state['changed_at'] : 0;
-			$evaluated      = self::evaluate_throttle_level( $metrics, $thresholds, $previous_level, $previous_at );
+			$evaluated      = HCQG_Load_Monitor::evaluate_level( $metrics, $thresholds, $previous_level, $previous_at );
 			$now            = time();
 			$changed_at     = $evaluated['level'] === $previous_level ? $previous_at : $now;
 
@@ -353,7 +320,12 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 			);
 
 			self::$throttle_runtime['decision'] = $decision;
-			self::persist_throttle_state( $decision );
+			HCQG_Load_Monitor::persist_state(
+				array(
+					'level'      => $decision['level'],
+					'changed_at' => $decision['changed_at'],
+				)
+			);
 			self::maybe_log_throttle_events( $decision );
 
 			return $decision;
@@ -382,26 +354,6 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 			}
 
 			return min( $value, $policy );
-		}
-
-		/**
-		 * Default throttle thresholds, filterable for host tuning.
-		 *
-		 * @return array<string,int>
-		 */
-		private static function get_throttle_thresholds() {
-			$thresholds = apply_filters( 'hypercart_query_guard_load_thresholds', self::THROTTLE_THRESHOLDS );
-			if ( ! is_array( $thresholds ) ) {
-				$thresholds = self::THROTTLE_THRESHOLDS;
-			}
-
-			$defaults = self::THROTTLE_THRESHOLDS;
-			$merged   = array_merge( $defaults, $thresholds );
-			foreach ( $merged as $key => $value ) {
-				$merged[ $key ] = max( 0, (int) $value );
-			}
-
-			return $merged;
 		}
 
 		/**
@@ -435,380 +387,6 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 			}
 
 			return $requested_mode;
-		}
-
-		/**
-		 * Identify the best available cross-request state backend.
-		 *
-		 * @return string
-		 */
-		private static function get_throttle_cache_backend() {
-			if ( null !== self::$throttle_cache_backend ) {
-				return self::$throttle_cache_backend;
-			}
-
-			if ( function_exists( 'wp_using_ext_object_cache' ) && wp_using_ext_object_cache() ) {
-				self::$throttle_cache_backend = 'persistent_object_cache';
-			} elseif ( self::is_apcu_available() ) {
-				self::$throttle_cache_backend = 'apcu';
-			} else {
-				self::$throttle_cache_backend = 'db_fallback';
-			}
-
-			return self::$throttle_cache_backend;
-		}
-
-		/**
-		 * Check whether APCu is available for request-local persistence.
-		 *
-		 * @return bool
-		 */
-		private static function is_apcu_available() {
-			if ( ! function_exists( 'apcu_fetch' ) || ! function_exists( 'apcu_store' ) ) {
-				return false;
-			}
-
-			if ( PHP_SAPI === 'cli' && ! (bool) ini_get( 'apc.enable_cli' ) ) {
-				return false;
-			}
-
-			return (bool) ini_get( 'apc.enabled' );
-		}
-
-		/**
-		 * Read the last persisted throttle state.
-		 *
-		 * @return array<string,mixed>
-		 */
-		private static function read_throttle_state() {
-			if ( null !== self::$throttle_state_cache ) {
-				return self::$throttle_state_cache;
-			}
-
-			$backend = self::get_throttle_cache_backend();
-			$state   = false;
-
-			if ( 'persistent_object_cache' === $backend ) {
-				$state = wp_cache_get( self::THROTTLE_CACHE_KEY, self::THROTTLE_CACHE_GROUP );
-			} elseif ( 'apcu' === $backend ) {
-				$success = false;
-				$state   = apcu_fetch( self::THROTTLE_CACHE_KEY, $success );
-				if ( ! $success ) {
-					$state = false;
-				}
-			} else {
-				$state = get_option( self::THROTTLE_STATE_OPTION, false );
-			}
-
-			if ( ! is_array( $state ) ) {
-				$state = array(
-					'level'      => self::THROTTLE_LEVEL_NORMAL,
-					'changed_at' => 0,
-				);
-			}
-
-			self::$throttle_state_cache = $state;
-			return $state;
-		}
-
-		/**
-		 * Persist hysteresis state across requests.
-		 *
-		 * @param array<string,mixed> $decision
-		 * @return void
-		 */
-		private static function persist_throttle_state( array $decision ) {
-			$state = array(
-				'level'      => $decision['level'],
-				'changed_at' => (int) $decision['changed_at'],
-			);
-			$previous = self::$throttle_state_cache;
-			$backend  = self::get_throttle_cache_backend();
-			$ttl      = max( 60, self::get_throttle_thresholds()['level_min_dwell_seconds'] * 4 );
-
-			if ( is_array( $previous ) && $previous === $state ) {
-				if ( 'persistent_object_cache' === $backend ) {
-					wp_cache_set( self::THROTTLE_CACHE_KEY, $state, self::THROTTLE_CACHE_GROUP, $ttl );
-				} elseif ( 'apcu' === $backend ) {
-					apcu_store( self::THROTTLE_CACHE_KEY, $state, $ttl );
-				}
-				return;
-			}
-
-			self::$throttle_state_cache = $state;
-
-			if ( 'persistent_object_cache' === $backend ) {
-				wp_cache_set( self::THROTTLE_CACHE_KEY, $state, self::THROTTLE_CACHE_GROUP, $ttl );
-				return;
-			}
-
-			if ( 'apcu' === $backend ) {
-				apcu_store( self::THROTTLE_CACHE_KEY, $state, $ttl );
-				return;
-			}
-
-			if ( false === get_option( self::THROTTLE_STATE_OPTION, false ) ) {
-				add_option( self::THROTTLE_STATE_OPTION, $state, '', false );
-				return;
-			}
-
-			update_option( self::THROTTLE_STATE_OPTION, $state, false );
-		}
-
-		/**
-		 * Probe available load signals.
-		 *
-		 * @return array<string,mixed>
-		 */
-		private static function collect_throttle_metrics() {
-			$threads_running = self::probe_threads_running();
-			$queue_depth     = self::probe_due_queue_depth();
-			$mode            = 'none';
-
-			if ( null !== $threads_running['value'] && null !== $queue_depth['value'] ) {
-				$mode = 'mixed';
-			} elseif ( null !== $threads_running['value'] ) {
-				$mode = 'threads_running';
-			} elseif ( null !== $queue_depth['value'] ) {
-				$mode = 'queue_depth';
-			}
-
-			return array(
-				'threads_running' => $threads_running['value'],
-				'queue_depth'     => $queue_depth['value'],
-				'probe_ms'        => array(
-					'threads_running' => $threads_running['ms'],
-					'queue_depth'     => $queue_depth['ms'],
-				),
-				'errors'          => array(
-					'threads_running' => $threads_running['error'],
-					'queue_depth'     => $queue_depth['error'],
-				),
-				'detector_mode'   => $mode,
-			);
-		}
-
-		/**
-		 * Probe MySQL Threads_running with direct mysqli to avoid polluting wpdb state.
-		 *
-		 * @return array{value:int|null,ms:int,error:string}
-		 */
-		private static function probe_threads_running() {
-			$result = self::run_mysqli_query( "SHOW STATUS LIKE 'Threads_running'" );
-			if ( empty( $result['rows'] ) || ! isset( $result['rows'][0]['Value'] ) ) {
-				return array(
-					'value' => null,
-					'ms'    => $result['ms'],
-					'error' => $result['error'],
-				);
-			}
-
-			return array(
-				'value' => (int) $result['rows'][0]['Value'],
-				'ms'    => $result['ms'],
-				'error' => '',
-			);
-		}
-
-		/**
-		 * Probe due queue depth from Action Scheduler's custom tables.
-		 *
-		 * @return array{value:int|null,ms:int,error:string}
-		 */
-		private static function probe_due_queue_depth() {
-			global $wpdb;
-
-			$table  = preg_replace( '/[^A-Za-z0-9_]/', '', $wpdb->prefix ) . 'actionscheduler_actions';
-			$sql    = "SELECT COUNT(*) AS count FROM `{$table}` WHERE status = 'pending' AND scheduled_date_gmt <= UTC_TIMESTAMP()";
-			$result = self::run_mysqli_query( $sql );
-
-			if ( empty( $result['rows'] ) || ! isset( $result['rows'][0]['count'] ) ) {
-				return array(
-					'value' => null,
-					'ms'    => $result['ms'],
-					'error' => $result['error'],
-				);
-			}
-
-			return array(
-				'value' => (int) $result['rows'][0]['count'],
-				'ms'    => $result['ms'],
-				'error' => '',
-			);
-		}
-
-		/**
-		 * Execute a direct mysqli query and return rows plus timing.
-		 *
-		 * @param string $sql
-		 * @return array{rows:array<int,array<string,string>>|null,ms:int,error:string}
-		 */
-		private static function run_mysqli_query( $sql ) {
-			global $wpdb;
-
-			if ( empty( $wpdb ) || empty( $wpdb->dbh ) || ! function_exists( 'mysqli_query' ) ) {
-				return array(
-					'rows'  => null,
-					'ms'    => 0,
-					'error' => 'mysqli_unavailable',
-				);
-			}
-
-			// Some WordPress sites replace wpdb's native mysqli handle with a
-			// different connection type via a db.php drop-in. Passing a non-mysqli
-			// object/resource into mysqli_query() throws a fatal TypeError on PHP 8+.
-			if ( ! ( $wpdb->dbh instanceof mysqli ) ) {
-				return array(
-					'rows'  => null,
-					'ms'    => 0,
-					'error' => 'not_mysqli_connection',
-				);
-			}
-
-			$start  = microtime( true );
-			$result = @mysqli_query( $wpdb->dbh, $sql );
-			$ms     = (int) round( ( microtime( true ) - $start ) * 1000 );
-
-			if ( false === $result ) {
-				return array(
-					'rows'  => null,
-					'ms'    => $ms,
-					'error' => function_exists( 'mysqli_error' ) ? (string) mysqli_error( $wpdb->dbh ) : 'mysqli_query_failed',
-				);
-			}
-
-			$rows = array();
-			while ( $row = mysqli_fetch_assoc( $result ) ) {
-				$rows[] = $row;
-			}
-			mysqli_free_result( $result );
-
-			return array(
-				'rows'  => $rows,
-				'ms'    => $ms,
-				'error' => '',
-			);
-		}
-
-		/**
-		 * Evaluate the next load level with hysteresis and minimum dwell.
-		 *
-		 * @param array<string,mixed> $metrics
-		 * @param array<string,int>   $thresholds
-		 * @param string              $previous_level
-		 * @param int                 $previous_at
-		 * @return array{level:string,raw_level:string}
-		 */
-		private static function evaluate_throttle_level( array $metrics, array $thresholds, $previous_level, $previous_at ) {
-			$threads_level = self::classify_metric_level(
-				$metrics['threads_running'],
-				$thresholds['threads_running_elevated'],
-				$thresholds['threads_running_critical'],
-				$thresholds['threads_running_elevated_exit'],
-				$thresholds['threads_running_critical_exit'],
-				$previous_level
-			);
-			$queue_level   = self::classify_metric_level(
-				$metrics['queue_depth'],
-				$thresholds['queue_depth_elevated'],
-				$thresholds['queue_depth_critical'],
-				$thresholds['queue_depth_elevated_exit'],
-				$thresholds['queue_depth_critical_exit'],
-				$previous_level
-			);
-			$raw_level     = self::pick_higher_level( $threads_level, $queue_level );
-
-			if ( 'none' === $metrics['detector_mode'] ) {
-				$raw_level = self::THROTTLE_LEVEL_ELEVATED;
-			}
-
-			if ( self::severity_for_level( $raw_level ) < self::severity_for_level( $previous_level ) ) {
-				$dwell = max( 0, (int) $thresholds['level_min_dwell_seconds'] );
-				if ( $previous_at > 0 && ( time() - $previous_at ) < $dwell ) {
-					return array(
-						'level'     => $previous_level,
-						'raw_level' => $raw_level,
-					);
-				}
-			}
-
-			return array(
-				'level'     => $raw_level,
-				'raw_level' => $raw_level,
-			);
-		}
-
-		/**
-		 * Convert a single metric to a throttling level with hysteresis exits.
-		 *
-		 * @param int|null $value
-		 * @param int      $elevated
-		 * @param int      $critical
-		 * @param int      $elevated_exit
-		 * @param int      $critical_exit
-		 * @param string   $previous_level
-		 * @return string
-		 */
-		private static function classify_metric_level( $value, $elevated, $critical, $elevated_exit, $critical_exit, $previous_level ) {
-			if ( null === $value ) {
-				return self::THROTTLE_LEVEL_NORMAL;
-			}
-
-			if ( self::THROTTLE_LEVEL_CRITICAL === $previous_level ) {
-				if ( $value >= $critical_exit ) {
-					return self::THROTTLE_LEVEL_CRITICAL;
-				}
-				if ( $value >= $elevated ) {
-					return self::THROTTLE_LEVEL_ELEVATED;
-				}
-				return self::THROTTLE_LEVEL_NORMAL;
-			}
-
-			if ( self::THROTTLE_LEVEL_ELEVATED === $previous_level ) {
-				if ( $value >= $critical ) {
-					return self::THROTTLE_LEVEL_CRITICAL;
-				}
-				if ( $value >= $elevated_exit ) {
-					return self::THROTTLE_LEVEL_ELEVATED;
-				}
-				return self::THROTTLE_LEVEL_NORMAL;
-			}
-
-			if ( $value >= $critical ) {
-				return self::THROTTLE_LEVEL_CRITICAL;
-			}
-			if ( $value >= $elevated ) {
-				return self::THROTTLE_LEVEL_ELEVATED;
-			}
-
-			return self::THROTTLE_LEVEL_NORMAL;
-		}
-
-		/**
-		 * Pick the higher-severity of two levels.
-		 *
-		 * @param string $left
-		 * @param string $right
-		 * @return string
-		 */
-		private static function pick_higher_level( $left, $right ) {
-			return self::severity_for_level( $left ) >= self::severity_for_level( $right ) ? $left : $right;
-		}
-
-		/**
-		 * Numeric severity for a throttle level.
-		 *
-		 * @param string $level
-		 * @return int
-		 */
-		private static function severity_for_level( $level ) {
-			if ( self::THROTTLE_LEVEL_CRITICAL === $level ) {
-				return 2;
-			}
-			if ( self::THROTTLE_LEVEL_ELEVATED === $level ) {
-				return 1;
-			}
-			return 0;
 		}
 
 		/**
