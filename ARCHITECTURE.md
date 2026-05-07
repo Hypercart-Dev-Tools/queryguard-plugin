@@ -2,14 +2,15 @@
 
 A high-level map of how the plugin is put together. Operational guidance — what to set, what to watch — lives in [README.md](README.md); this document is for engineers reading or modifying the code.
 
-## Two independent subsystems
+## Three independent subsystems
 
-The plugin solves two related but separable problems and runs them as independent subsystems with their own modes, hooks, and state:
+The plugin solves three related but separable problems and runs them as independent subsystems with their own modes, hooks, and state:
 
 1. **Query timeout circuit breaker** — `SET SESSION MAX_EXECUTION_TIME` early in each request, log kills, surface admin recovery notices.
 2. **Action Scheduler throttle** — under sustained MySQL load, slow the AS queue runner (Wave A) and defer individual low-priority actions (Wave B).
+3. **Mutex Guard** — coalesce concurrent invocations of the same operation (Wave C). Independent of MySQL load; addresses thundering-herd patterns where the *same* expensive operation gets started N times in parallel.
 
-The two subsystems share a request, a logger, and the request-context detection helper. They do **not** share modes (`HYPERCART_QUERY_GUARD_MODE` controls #1; `HYPERCART_QUERY_GUARD_THROTTLE_MODE` controls #2). Either can be disabled without affecting the other.
+The subsystems share a request, a logger, and the request-context detection helper. They do **not** share modes (`HYPERCART_QUERY_GUARD_MODE` controls #1; `HYPERCART_QUERY_GUARD_THROTTLE_MODE` controls #2; #3 has no mode constant — it's an opt-in primitive that callers use directly). Any of the three can be disabled without affecting the others.
 
 ## File layout
 
@@ -17,17 +18,20 @@ The two subsystems share a request, a logger, and the request-context detection 
 hypercart-query-guard.php       # Plugin entrypoint + Hypercart_Query_Guard
 class-hcqg-load-monitor.php     # HCQG_Load_Monitor (probes, hysteresis, persistence)
 class-hcqg-priority-registry.php # HCQG_Priority_Registry (hook → tier resolution)
+class-hcqg-mutex-guard.php      # HCQG_Mutex_Guard (atomic acquire/release on wp_options)
 tests/
-  bootstrap.php                 # WP function stubs + plugin require
+  bootstrap.php                 # WP function stubs + $wpdb stub + plugin require
   PriorityRegistryTest.php
   LoadMonitorTest.php
   ActionThrottleTest.php
+  MutexGuardTest.php
 ```
 
-Why three classes instead of one:
+Why a class per subsystem:
 - `HCQG_Load_Monitor` is pure-ish (filter calls aside, the hysteresis math is a pure function), so it's the easiest unit to test independently.
 - `HCQG_Priority_Registry` has a public filter contract and is consumed by both Wave A's logging and Wave B's deferral logic; isolating it gives a single source of truth for tier resolution.
-- `Hypercart_Query_Guard` is the orchestrator: it owns request-context detection, mode resolution, hook registration, and the throttle-decision pipeline. It's the layer with the most WordPress / Action Scheduler dependencies.
+- `HCQG_Mutex_Guard` has its own contract (raw `$wpdb` SQL, `wp_options` storage, atomic `INSERT … ON DUPLICATE KEY UPDATE`) that's intentionally distinct from the WP-API-shaped code in the rest of the plugin. Isolating it makes that contract loud rather than buried.
+- `Hypercart_Query_Guard` is the orchestrator for subsystems 1 and 2: it owns request-context detection, mode resolution, hook registration, and the throttle-decision pipeline. It's the layer with the most WordPress / Action Scheduler dependencies.
 
 ## Subsystem 1: Query timeout circuit breaker
 
@@ -101,7 +105,45 @@ On `action_scheduler_before_execute`, [`maybe_defer_action_before_execute()`](hy
 ### Why the priority registry is its own class
 `HCQG_Priority_Registry` enforces a strict filter contract: tier list is fixed (`critical`, `high`, `normal`, `deferrable`) and always evaluated in declaration order; filters can override patterns within a tier, clear a tier (empty array), or be ignored if they return unknown tiers. This invariant matters because Wave B's matrix is keyed by tier — a filter that leaks an unrecognized tier would silently produce "no defer" instead of erroring.
 
-## State model
+## Subsystem 3: Mutex Guard
+
+Coalesce concurrent invocations of the same operation across all PHP workers and (when the database is shared) all hosts. Independent of the throttle subsystem — usable with `HYPERCART_QUERY_GUARD_THROTTLE_MODE = 'off'`.
+
+### Atomic acquire flow
+```
+HCQG_Mutex_Guard::acquire_lock( $key, $ttl )
+        │
+        ▼
+ INSERT INTO wp_options (option_name, option_value, autoload)
+   VALUES (hcqg_mutex_<md5($key)>, '<expires_at>|<nonce>', 'no')
+   ON DUPLICATE KEY UPDATE option_value = IF(
+     CAST(SUBSTRING_INDEX(option_value, '|', 1) AS UNSIGNED) < <time()>,  ◄── PHP-anchored
+     VALUES(option_value),
+     option_value
+   )
+        │
+        ▼
+ inspect $wpdb->rows_affected
+   1 → fresh INSERT ........... acquired (return nonce)
+   2 → UPDATE replaced expired ► acquired (return nonce)
+   0 → live lock held .......... return false (log mutex_held)
+```
+
+Three correctness invariants the class enforces, documented loudly in the file header because they're easy to break with a well-meaning refactor:
+
+1. **No `add_option`/`update_option`.** Read-then-write is TOCTOU; only `INSERT … ON DUPLICATE KEY UPDATE` is atomic at the row level.
+2. **No `UNIX_TIMESTAMP()` in SQL.** Time anchoring uses PHP's `time()` passed as a `%d` parameter so web/DB clock skew on managed hosts can't make the effective TTL differ from the requested TTL.
+3. **No per-request memoization on acquire.** Memoization creates a same-process reentrancy hole — A acquires, B "acquires" via memo, A releases, an external process takes the lock, A and B both run the work. Each `acquire_lock` call is one bounded SQL statement; in steady state under contention, the first caller wins and every peer gets `rows_affected = 0` and returns false. There's no thrashing to mitigate.
+
+### Lock value format
+`expires_at|nonce` delimited string (e.g. `1739564821|a4f9c2e8b1d3f607`). The nonce is 16 hex chars from `random_bytes(8)`. Release and refresh use the trailing nonce as a CAS predicate (`SUBSTRING_INDEX(option_value, '|', -1) = %s`) so a process whose work overran TTL doesn't accidentally release the next holder's lock when it finally calls `release_lock()`.
+
+The delimited shape (over JSON) makes `SUBSTRING_INDEX` extraction work on every supported MySQL/MariaDB version without depending on `JSON_EXTRACT()`.
+
+### Option name encoding
+`option_name` is `'hcqg_mutex_' . md5($operation_key)` (43 chars, fixed) so caller-supplied keys can be arbitrary length without overflowing `wp_options.option_name`'s `varchar(191)` limit. The raw key flows through to log payloads so operators investigating contention see human-readable keys, not hashes.
+
+### State model
 
 | State | Lives in | TTL | Notes |
 | --- | --- | --- | --- |
@@ -109,6 +151,7 @@ On `action_scheduler_before_execute`, [`maybe_defer_action_before_execute()`](hy
 | Throttle decision | static memo on `Hypercart_Query_Guard` | request | One probe per request, regardless of how many queue-runner filters fire |
 | Load level + transition timestamp | persistent object cache → APCu → wp_options | `dwell × 4`, min 60s | Cross-request hysteresis state; option fallback is low-write (only written when level transitions) |
 | Defer count per (hook, args, group) | object cache | 1 hour | Best-effort cap; resets per-request on hosts without persistent caching |
+| Mutex lock rows | wp_options (autoload no) | caller-supplied TTL via embedded `expires_at` | One row per active mutex key, hash-keyed; expired rows are ignored on read and overwritten on next acquire |
 | Admin search recovery notice | transient | 60s | Per-user, cleared on first render |
 | Cache backend selection | static memo on `HCQG_Load_Monitor` | request | Computed once, never recomputed |
 
@@ -116,7 +159,7 @@ On `action_scheduler_before_execute`, [`maybe_defer_action_before_execute()`](hy
 
 ## Mode matrix
 
-Two independent mode dimensions:
+Two independent mode dimensions for subsystems 1 and 2; subsystem 3 has no mode constant.
 
 | `HYPERCART_QUERY_GUARD_MODE` | Effect |
 | --- | --- |
@@ -132,6 +175,8 @@ Two independent mode dimensions:
 | `enforce` | Queue-runner caps applied; per-action defers via clone-and-cancel |
 
 `enforce` for the throttle can downgrade to `observe` at runtime if the `hypercart_query_guard_throttle_require_persistent_cache` filter is true and no persistent backend is available — the decision carries a `blocked_reason: persistent_cache_required` field for visibility.
+
+The Mutex Guard has no mode — it's an opt-in primitive. Callers either invoke it or they don't; there's no global "do nothing" switch because the subsystem does nothing on its own.
 
 ## Extension points (the public-ish API)
 
@@ -155,17 +200,20 @@ These are the filters the rest of the codebase commits to keeping stable. Adding
 
 The two registry filters use **extend-not-replace** semantics: omitted tiers / cells inherit defaults; pass an explicit empty array (or 0) to clear.
 
+**Mutex Guard (subsystem 3)**
+The four primitives plus the `with_lock()` convenience wrapper are static methods on `HCQG_Mutex_Guard`; there's no filter surface in v1. Callers compose them directly. Default TTL (`60s`) is the only currently-tunable knob, and it's a per-call argument rather than a global filter.
+
 ## Logging
 
 All structured records go through `Hypercart_Query_Guard::log()`, which prefers `Hypercart_Logger` if present (the file-based logger from the Performance Monitor plugin) and falls back to `error_log()` with single-line JSON for grep-ability. Every record carries an `event` field; the full event vocabulary is documented in [README.md](README.md#logging).
 
 ## Testing model
 
-The suite is deliberately WP-free. [`tests/bootstrap.php`](tests/bootstrap.php) stubs the small set of WordPress functions the plugin actually touches (`apply_filters`, `wp_cache_*`, `get_option`, `wp_using_ext_object_cache`, etc.) with stateful in-process implementations resettable between tests via `WP_Stub_State::reset()`.
+The suite is deliberately WP-free. [`tests/bootstrap.php`](tests/bootstrap.php) stubs the small set of WordPress functions the plugin actually touches (`apply_filters`, `wp_cache_*`, `get_option`, `wp_using_ext_object_cache`, etc.) with stateful in-process implementations resettable between tests via `WP_Stub_State::reset()`. For the Mutex Guard subsystem, a minimal `WP_Stub_DB` stub models the surface of `$wpdb` the SUT touches — `prepare()` / `query()` / `get_var()` / `rows_affected` / `options` — with FIFO queues that tests use to stage return values and an SQL capture array for query-shape assertions.
 
 The bootstrap also forces both modes to `off` before requiring `hypercart-query-guard.php`, so `Hypercart_Query_Guard::init()` early-returns instead of registering hooks against the (non-existent) WP runtime.
 
-Pure functions are tested directly. Private statics are tested via `ReflectionMethod`. Anything that requires a real Action Scheduler (`build_deferred_action_clone`, `defer_action`, the actual `before_execute` orchestration) is **not** unit-tested — that's deliberate. Those paths need integration coverage on a real WordPress + WooCommerce stack and are validated through the rollout sequence: `test_observe` → `observe` → `enforce`, with logs reviewed at each step.
+Pure functions are tested directly. Private statics are tested via `ReflectionMethod`. Anything that requires a real Action Scheduler (`build_deferred_action_clone`, `defer_action`, the actual `before_execute` orchestration) is **not** unit-tested — that's deliberate. The same gap applies to the Mutex Guard's actual MySQL semantics (`INSERT ... ON DUPLICATE KEY UPDATE` atomicity, `rows_affected = 2` on the expired-takeover branch): unit tests cover query shape, return mapping, and serialization, but the SQL itself is validated through staging integration during rollout. These gaps are explicit, not accidental.
 
 Run with `composer install && vendor/bin/phpunit`.
 

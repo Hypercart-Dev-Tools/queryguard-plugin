@@ -37,6 +37,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 require_once __DIR__ . '/class-hcqg-load-monitor.php';
 require_once __DIR__ . '/class-hcqg-priority-registry.php';
+require_once __DIR__ . '/class-hcqg-mutex-guard.php';
 
 if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 
