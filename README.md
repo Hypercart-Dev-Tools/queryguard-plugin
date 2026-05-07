@@ -111,7 +111,7 @@ add_filter( 'hypercart_query_guard_limit_ms', function( $ms, $context ) {
 
 ## Logging
 
-If `Hypercart_Logger` (from the Hypercart Performance Monitor plugin) is present, log lines route through it. Otherwise the plugin falls back to `error_log()` with single-line JSON for `grep`-ability:
+If `Hypercart_Logger` (from the [Hypercart Helper plugin](https://github.com/Hypercart-Dev-Tools/Hypercart-Helper-WP-plugin)) is active, log lines route through it to `wp-content/hypercart-logs/`. Otherwise the plugin falls back to `error_log()` with single-line JSON for `grep`-ability:
 
 ```
 [hypercart_query_guard][error] {"event":"query_killed","context":"admin_ajax","limit_ms":20000,"last_query":"SELECT * FROM wp_nf_transactions WHERE meta_key = '_nofraud_transaction_status_workaround'","uri":"/wp-admin/admin-ajax.php","user_id":0,"time":1745875234}

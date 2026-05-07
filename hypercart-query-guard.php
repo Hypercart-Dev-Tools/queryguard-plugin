@@ -30,6 +30,26 @@
  * @package Hypercart
  */
 
+/*
+ * Dependencies: none. This plugin is fully standalone.
+ *
+ * Optional integrations:
+ *
+ *   Hypercart Helper (Hypercart-Dev-Tools/Hypercart-Helper-WP-plugin)
+ *     Provides the Hypercart_Logger class used for structured file-based
+ *     logging to wp-content/hypercart-logs/. If active, log output routes
+ *     through it automatically. If absent, this plugin falls back to PHP's
+ *     error_log() with single-line JSON.
+ *
+ *   Hypercart Performance Monitor (NeochromeTeam/hypercart-performance-monitor)
+ *     Consumes Hypercart_Logger (requires Helper). Not a direct dependency of
+ *     this plugin, but often deployed alongside it on the same stores.
+ *
+ * When deployed as an MU-plugin this file loads before regular plugins, so
+ * Hypercart_Logger may not be available at load time. The integration is
+ * resolved at log-call time via class_exists() / method_exists() checks.
+ */
+
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
@@ -1127,9 +1147,8 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		}
 
 		/**
-		 * Centralized log emitter. Prefers Hypercart_Logger if present (your
-		 * existing file-based logger from the Performance Monitor plugin),
-		 * falls back to error_log so this MU-plugin works standalone.
+		 * Centralized log emitter. Prefers Hypercart_Logger if present (from
+		 * the Hypercart Helper plugin), falls back to error_log standalone.
 		 *
 		 * @param string $level   'info' | 'warn' | 'error'
 		 * @param array  $payload Structured fields.
