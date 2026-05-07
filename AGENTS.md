@@ -4,6 +4,24 @@ Welcome to the `queryguard-plugin` repository. This is a mission-critical infras
 
 AI agents and human contributors must strictly adhere to the following architectural, formatting, and behavioral guidelines to maintain the current high standards of code quality (DRY, SOLID).
 
+## 0. Start Here: Read the Map Before Scanning the Codebase
+
+**At the start of every new agent session, read [ARCHITECTURE.md](ARCHITECTURE.md) first.** It is the project's index — designed to be a fast, complete map so you can jump to the relevant subsystem instead of scanning the whole repo.
+
+Specifically, ARCHITECTURE.md tells you:
+
+*   **Which of the three subsystems your task lives in** (query timeout circuit breaker / Action Scheduler throttle / Mutex Guard) and which file owns it.
+*   **The file layout** with one-line responsibility hints for every `class-hcqg-*.php` and every test file.
+*   **The decision pipelines** (subsystem 2's throttle decision, subsystem 3's atomic acquire flow) so you can trace request behavior without re-deriving it from `grep`.
+*   **The state model** — what's persisted, where, with what TTL, and which class owns the read/write path.
+*   **The mode matrix** — what each `HYPERCART_QUERY_GUARD_MODE` and `HYPERCART_QUERY_GUARD_THROTTLE_MODE` value actually does.
+*   **The public-ish filter surface** — which filters are stable and which are internal.
+*   **The testing model** — what's unit-tested, what's deliberately integration-only, and why each gap exists.
+
+After reading ARCHITECTURE.md, scope your search to the named files for the subsystem you're touching. Reading one focused class is almost always faster than `grep`-ing the whole codebase, and matches the SRP boundaries in section 1 below.
+
+If you find a discrepancy between ARCHITECTURE.md and the code, that's a bug — flag it before proceeding rather than silently picking one as authoritative.
+
 ## 1. Architectural Principles (SOLID)
 
 This codebase uses a pragmatic application of SOLID principles adapted for the WordPress environment. 
