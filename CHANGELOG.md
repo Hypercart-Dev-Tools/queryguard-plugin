@@ -20,6 +20,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - **PHPUnit suite for the extracted classes.** `tests/` adds 34 unit tests covering `HCQG_Priority_Registry` (wildcard/anchored/exact pattern matching, tier order, override/clear/inherit semantics, filter validation) and `HCQG_Load_Monitor` (threshold filter override + clamp, dwell, hysteresis exits in both directions, mixed-metric severity pick, "no detector" failsafe, and round-trip persistence across both `db_fallback` and `persistent_object_cache` backends). The bootstrap stubs the small set of WP functions the classes touch, so the suite has no WordPress runtime dependency and runs from `vendor/bin/phpunit` after `composer install`.
 
+- **Initial Wave B per-action throttling.** Query Guard now resolves Action Scheduler hook names through the priority registry and can defer individual actions from `action_scheduler_before_execute` based on priority tier × load level, with filterable delay defaults and structured `as_action_deferred` logging.
+
 ### Fixed
 
 - **Throttle probes now fail closed on non-MySQL db drop-ins instead of fatalling on PHP 8+.** `run_mysqli_query()` previously assumed `$wpdb->dbh` was always a native `mysqli` handle when `mysqli_query()` existed. On sites using a custom `db.php` drop-in with a different connection type (for example SQLite or custom routing layers), passing that handle into `mysqli_query()` could throw a fatal `TypeError` on PHP 8+. The probe now verifies `instanceof mysqli` before calling any `mysqli_*` API and degrades to a logged probe error when the connection is not native MySQLi.

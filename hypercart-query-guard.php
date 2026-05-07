@@ -81,6 +81,26 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		);
 
 		/**
+		 * Default per-action deferral delays by load level and priority tier.
+		 *
+		 * Values are in seconds. 0 means "run immediately".
+		 */
+		const THROTTLE_ACTION_DELAYS = array(
+			'elevated' => array(
+				'critical'   => 0,
+				'high'       => 0,
+				'normal'     => 300,
+				'deferrable' => 900,
+			),
+			'critical' => array(
+				'critical'   => 0,
+				'high'       => 300,
+				'normal'     => 900,
+				'deferrable' => 3600,
+			),
+		);
+
+		/**
 		 * Warning threshold for observe-mode logging (ms).
 		 * Queries slower than this get logged but not killed.
 		 */
@@ -153,6 +173,7 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				add_filter( 'action_scheduler_queue_runner_batch_size', array( __CLASS__, 'filter_queue_runner_batch_size' ), 99 );
 				add_filter( 'action_scheduler_queue_runner_time_limit', array( __CLASS__, 'filter_queue_runner_time_limit' ), 99 );
 				add_filter( 'action_scheduler_queue_runner_concurrent_batches', array( __CLASS__, 'filter_queue_runner_concurrent_batches' ), 99 );
+				add_action( 'action_scheduler_before_execute', array( __CLASS__, 'maybe_defer_action_before_execute' ), 1, 2 );
 			}
 
 			// Apply the SET SESSION early. Priority 1 on 'init' is as early as
@@ -283,6 +304,54 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		}
 
 		/**
+		 * Per-action throttle hook. Runs before Action Scheduler executes the callback.
+		 *
+		 * @param int    $action_id
+		 * @param string $runner_context
+		 * @return void
+		 */
+		public static function maybe_defer_action_before_execute( $action_id, $runner_context ) {
+			$decision = self::get_throttle_decision();
+			if ( self::THROTTLE_LEVEL_NORMAL === $decision['level'] ) {
+				return;
+			}
+
+			$action_decision = self::get_action_throttle_decision( (int) $action_id, (string) $runner_context, $decision );
+			if ( empty( $action_decision['should_defer'] ) ) {
+				return;
+			}
+
+			$rescheduled_action_id = 0;
+			if ( self::THROTTLE_MODE_ENFORCE === $decision['effective_mode'] ) {
+				$rescheduled_action_id = self::defer_action( (int) $action_id, $action_decision );
+				if ( $rescheduled_action_id <= 0 ) {
+					return;
+				}
+			}
+
+			self::log(
+				'info',
+				array(
+					'event'                => 'as_action_deferred',
+					'action_id'            => (int) $action_id,
+					'rescheduled_action_id' => (int) $rescheduled_action_id,
+					'hook'                 => $action_decision['hook'],
+					'group'                => $action_decision['group'],
+					'priority_tier'        => $action_decision['priority_tier'],
+					'delay_seconds'        => $action_decision['delay_seconds'],
+					'requested_mode'       => $decision['requested_mode'],
+					'effective_mode'       => $decision['effective_mode'],
+					'load_level'           => $decision['level'],
+					'runner_context'       => (string) $runner_context,
+					'detector_mode'        => $decision['metrics']['detector_mode'],
+					'threads_running'      => $decision['metrics']['threads_running'],
+					'queue_depth'          => $decision['metrics']['queue_depth'],
+					'uri'                  => isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '',
+				)
+			);
+		}
+
+		/**
 		 * Resolve the throttle decision once per request.
 		 *
 		 * @return array<string,mixed>
@@ -370,6 +439,32 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		}
 
 		/**
+		 * Default per-action delay matrix, filterable per store.
+		 *
+		 * @return array<string,array<string,int>>
+		 */
+		private static function get_action_delay_matrix() {
+			$matrix = apply_filters( 'hypercart_query_guard_action_delay_matrix', self::THROTTLE_ACTION_DELAYS );
+			if ( ! is_array( $matrix ) ) {
+				return self::THROTTLE_ACTION_DELAYS;
+			}
+
+			$normalized = self::THROTTLE_ACTION_DELAYS;
+			foreach ( $normalized as $level => $tiers ) {
+				if ( ! isset( $matrix[ $level ] ) || ! is_array( $matrix[ $level ] ) ) {
+					continue;
+				}
+				foreach ( $tiers as $tier => $delay ) {
+					if ( isset( $matrix[ $level ][ $tier ] ) ) {
+						$normalized[ $level ][ $tier ] = max( 0, (int) $matrix[ $level ][ $tier ] );
+					}
+				}
+			}
+
+			return $normalized;
+		}
+
+		/**
 		 * Choose the effective throttle mode after capability checks.
 		 *
 		 * @param string $requested_mode
@@ -387,6 +482,135 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 			}
 
 			return $requested_mode;
+		}
+
+		/**
+		 * Build a per-action deferral decision for the current load state.
+		 *
+		 * @param int                 $action_id
+		 * @param string              $runner_context
+		 * @param array<string,mixed> $decision
+		 * @return array<string,mixed>
+		 */
+		private static function get_action_throttle_decision( $action_id, $runner_context, array $decision ) {
+			$store = ActionScheduler_Store::instance();
+
+			try {
+				$action = $store->fetch_action( $action_id );
+			} catch ( Throwable $e ) {
+				return array(
+					'should_defer' => false,
+					'reason'       => 'fetch_failed',
+				);
+			}
+
+			$hook          = (string) $action->get_hook();
+			$group         = (string) $action->get_group();
+			$priority_tier = HCQG_Priority_Registry::get_priority( $hook );
+			$delay_seconds = self::get_action_delay_seconds( $decision['level'], $priority_tier );
+
+			return array(
+				'should_defer'  => $delay_seconds > 0,
+				'action'        => $action,
+				'action_id'     => (int) $action_id,
+				'hook'          => $hook,
+				'group'         => $group,
+				'priority_tier' => $priority_tier,
+				'delay_seconds' => $delay_seconds,
+				'runner_context' => $runner_context,
+			);
+		}
+
+		/**
+		 * Resolve the delay for a given load level and priority tier.
+		 *
+		 * @param string $load_level
+		 * @param string $priority_tier
+		 * @return int
+		 */
+		private static function get_action_delay_seconds( $load_level, $priority_tier ) {
+			$matrix = self::get_action_delay_matrix();
+
+			if ( ! isset( $matrix[ $load_level ] ) || ! is_array( $matrix[ $load_level ] ) ) {
+				return 0;
+			}
+
+			return isset( $matrix[ $load_level ][ $priority_tier ] ) ? max( 0, (int) $matrix[ $load_level ][ $priority_tier ] ) : 0;
+		}
+
+		/**
+		 * Reschedule an action for later, then cancel and unclaim the current one.
+		 *
+		 * @param int                 $action_id
+		 * @param array<string,mixed> $action_decision
+		 * @return int New action ID, or 0 on failure.
+		 */
+		private static function defer_action( $action_id, array $action_decision ) {
+			$store  = ActionScheduler_Store::instance();
+			$action = $action_decision['action'];
+
+			try {
+				$new_action = self::build_deferred_action_clone( $action, (int) $action_decision['delay_seconds'] );
+				$new_id     = (int) $store->save_action( $new_action );
+				if ( $new_id <= 0 ) {
+					return 0;
+				}
+
+				$store->cancel_action( $action_id );
+				$store->unclaim_action( $action_id );
+
+				return $new_id;
+			} catch ( Throwable $e ) {
+				self::log(
+					'warn',
+					array(
+						'event'         => 'as_action_defer_failed',
+						'action_id'     => (int) $action_id,
+						'hook'          => isset( $action_decision['hook'] ) ? $action_decision['hook'] : '',
+						'delay_seconds' => isset( $action_decision['delay_seconds'] ) ? (int) $action_decision['delay_seconds'] : 0,
+						'error'         => $e->getMessage(),
+					)
+				);
+			}
+
+			return 0;
+		}
+
+		/**
+		 * Clone an existing scheduled action with a delayed next run.
+		 *
+		 * Recurring schedules keep their recurrence metadata; async and single
+		 * actions are converted to a delayed single-run schedule.
+		 *
+		 * @param ActionScheduler_Action $action
+		 * @param int                    $delay_seconds
+		 * @return ActionScheduler_Action
+		 * @throws Exception When the schedule type cannot be deferred safely.
+		 */
+		private static function build_deferred_action_clone( ActionScheduler_Action $action, $delay_seconds ) {
+			$run_at   = as_get_datetime_object( time() + max( 0, (int) $delay_seconds ) );
+			$schedule = $action->get_schedule();
+
+			if ( method_exists( $schedule, 'is_recurring' ) && $schedule->is_recurring() ) {
+				$schedule_class = get_class( $schedule );
+				if ( ! in_array( $schedule_class, array( 'ActionScheduler_IntervalSchedule', 'ActionScheduler_CronSchedule' ), true ) ) {
+					throw new Exception( 'unsupported_recurring_schedule' );
+				}
+
+				$new_schedule = new $schedule_class( $run_at, $schedule->get_recurrence(), $schedule->get_first_date() );
+			} else {
+				$new_schedule = new ActionScheduler_SimpleSchedule( $run_at );
+			}
+
+			$new_action = new ActionScheduler_Action(
+				$action->get_hook(),
+				$action->get_args(),
+				$new_schedule,
+				$action->get_group()
+			);
+			$new_action->set_priority( $action->get_priority() );
+
+			return $new_action;
 		}
 
 		/**

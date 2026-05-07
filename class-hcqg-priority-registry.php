@@ -98,8 +98,6 @@ if ( ! class_exists( 'HCQG_Priority_Registry' ) ) {
 		/**
 		 * Resolve a hook name to a priority tier.
 		 *
-		 * This registry is inert until Wave B wires it into throttle decisions.
-		 *
 		 * The `hypercart_query_guard_action_priority` filter may override the
 		 * resolved tier, but its return value MUST be one of self::TIERS;
 		 * unknown tier strings are ignored and the registry-resolved tier is
