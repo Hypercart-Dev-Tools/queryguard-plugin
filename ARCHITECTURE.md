@@ -136,7 +136,7 @@ Three correctness invariants the class enforces, documented loudly in the file h
 3. **No per-request memoization on acquire.** Memoization creates a same-process reentrancy hole — A acquires, B "acquires" via memo, A releases, an external process takes the lock, A and B both run the work. Each `acquire_lock` call is one bounded SQL statement; in steady state under contention, the first caller wins and every peer gets `rows_affected = 0` and returns false. There's no thrashing to mitigate.
 
 ### Lock value format
-`expires_at|nonce` delimited string (e.g. `1739564821|a4f9c2e8b1d3f607`). The nonce is 16 hex chars from `random_bytes(8)`. Release and refresh use the trailing nonce as a CAS predicate (`SUBSTRING_INDEX(option_value, '|', -1) = %s`) so a process whose work overran TTL doesn't accidentally release the next holder's lock when it finally calls `release_lock()`.
+`expires_at|nonce` delimited string (e.g. `1739564821|a4f9c2e8b1d3f607`). The nonce is 16 hex chars from `random_bytes(8)`. Release and force_release use the trailing nonce as a CAS predicate (`SUBSTRING_INDEX(option_value, '|', -1) = %s`) so a process whose work overran TTL doesn't accidentally release the next holder's lock when it finally calls `release_lock()`.
 
 The delimited shape (over JSON) makes `SUBSTRING_INDEX` extraction work on every supported MySQL/MariaDB version without depending on `JSON_EXTRACT()`.
 

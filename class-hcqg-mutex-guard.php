@@ -50,6 +50,11 @@ if ( ! class_exists( 'HCQG_Mutex_Guard' ) ) {
 		 */
 		const NONCE_BYTES = 8;
 
+		// SAFETY: interpolated into SQL via string concat (not %s) so
+		// SUBSTRING_INDEX can extract fields. Must remain a single
+		// character that is safe in SQL literals and disjoint from
+		// hex nonce chars. Do not change without auditing acquire_lock
+		// and release_lock SQL.
 		const VALUE_DELIMITER = '|';
 
 		const DEFAULT_TTL = 60;
@@ -341,7 +346,7 @@ if ( ! class_exists( 'HCQG_Mutex_Guard' ) ) {
 					'event'         => 'mutex_held',
 					'operation_key' => (string) $operation_key,
 					'option_name'   => $option_name,
-					'uri'           => isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '',
+					'uri'           => isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '',
 				)
 			);
 		}

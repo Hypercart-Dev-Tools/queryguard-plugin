@@ -114,7 +114,7 @@ if ( ! class_exists( 'HCQG_Load_Monitor' ) ) {
 				$state = wp_cache_get( self::CACHE_KEY, self::CACHE_GROUP );
 			} elseif ( 'apcu' === $backend ) {
 				$success = false;
-				$state   = apcu_fetch( self::CACHE_KEY, $success );
+				$state   = apcu_fetch( self::CACHE_GROUP . ':' . self::CACHE_KEY, $success );
 				if ( ! $success ) {
 					$state = false;
 				}
@@ -152,7 +152,7 @@ if ( ! class_exists( 'HCQG_Load_Monitor' ) ) {
 				if ( 'persistent_object_cache' === $backend ) {
 					wp_cache_set( self::CACHE_KEY, $next_state, self::CACHE_GROUP, $ttl );
 				} elseif ( 'apcu' === $backend ) {
-					apcu_store( self::CACHE_KEY, $next_state, $ttl );
+					apcu_store( self::CACHE_GROUP . ':' . self::CACHE_KEY, $next_state, $ttl );
 				}
 				return;
 			}
@@ -165,7 +165,7 @@ if ( ! class_exists( 'HCQG_Load_Monitor' ) ) {
 			}
 
 			if ( 'apcu' === $backend ) {
-				apcu_store( self::CACHE_KEY, $next_state, $ttl );
+				apcu_store( self::CACHE_GROUP . ':' . self::CACHE_KEY, $next_state, $ttl );
 				return;
 			}
 

@@ -387,7 +387,7 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 					'detector_mode'        => $decision['metrics']['detector_mode'],
 					'threads_running'      => $decision['metrics']['threads_running'],
 					'queue_depth'          => $decision['metrics']['queue_depth'],
-					'uri'                  => isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '',
+					'uri'                  => isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '',
 				)
 			);
 		}
@@ -703,7 +703,7 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 
 		private static function defer_count_key( $hook, array $args, $group ) {
 			$encoded = function_exists( 'wp_json_encode' ) ? wp_json_encode( $args ) : json_encode( $args );
-			$hash    = hash( 'crc32', $hook . '|' . (string) $group . '|' . (string) $encoded );
+			$hash    = md5( $hook . '|' . (string) $group . '|' . (string) $encoded );
 			return self::DEFER_COUNT_KEY_PREFIX . $hash;
 		}
 
@@ -744,7 +744,7 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				'errors'          => $decision['metrics']['errors'],
 				'blocked_reason'  => $decision['blocked_reason'],
 				'policy'          => $decision['policy'],
-				'uri'             => isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '',
+				'uri'             => isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '',
 			);
 
 			if ( self::THROTTLE_MODE_TEST_OBSERVE === $decision['effective_mode'] ) {
@@ -941,7 +941,7 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				'context'    => self::detect_context(),
 				'limit_ms'   => self::get_limit_ms(),
 				'last_query' => self::truncate( (string) $wpdb->last_query, 500 ),
-				'uri'        => isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '',
+				'uri'        => isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '',
 				'user_id'    => function_exists( 'get_current_user_id' ) ? get_current_user_id() : 0,
 				'time'       => time(),
 			);
@@ -1012,7 +1012,7 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 
 			$threshold_s = self::WARN_THRESHOLD_MS / 1000;
 			$context     = self::detect_context();
-			$uri         = isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '';
+			$uri         = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '';
 
 			foreach ( $wpdb->queries as $row ) {
 				// $row = [ $query, $duration_seconds, $callstack, $start_microtime, ... ]
