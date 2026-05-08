@@ -476,7 +476,20 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 			if ( ! is_array( $policy ) ) {
 				return self::THROTTLE_POLICY;
 			}
-			return $policy;
+
+			$normalized = self::THROTTLE_POLICY;
+			foreach ( $normalized as $level => $fields ) {
+				if ( ! isset( $policy[ $level ] ) || ! is_array( $policy[ $level ] ) ) {
+					continue;
+				}
+				foreach ( $fields as $field => $default ) {
+					if ( isset( $policy[ $level ][ $field ] ) ) {
+						$normalized[ $level ][ $field ] = max( 0, (int) $policy[ $level ][ $field ] );
+					}
+				}
+			}
+
+			return $normalized;
 		}
 
 		/**
@@ -639,7 +652,6 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				}
 
 				$store->cancel_action( $action_id );
-				$store->unclaim_action( $action_id );
 
 				return $new_id;
 			} catch ( Throwable $e ) {
@@ -713,9 +725,17 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 
 		private static function increment_defer_count( $hook, array $args, $group ) {
 			$key   = self::defer_count_key( $hook, $args, $group );
-			$count = (int) wp_cache_get( $key, HCQG_Load_Monitor::CACHE_GROUP ) + 1;
-			wp_cache_set( $key, $count, HCQG_Load_Monitor::CACHE_GROUP, self::DEFER_COUNT_TTL );
-			return $count;
+			$group_key = HCQG_Load_Monitor::CACHE_GROUP;
+
+			wp_cache_add( $key, 0, $group_key, self::DEFER_COUNT_TTL );
+			$count = wp_cache_incr( $key, 1, $group_key );
+
+			if ( false === $count ) {
+				$count = (int) wp_cache_get( $key, $group_key ) + 1;
+				wp_cache_set( $key, $count, $group_key, self::DEFER_COUNT_TTL );
+			}
+
+			return (int) $count;
 		}
 
 		/**

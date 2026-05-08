@@ -1,7 +1,7 @@
 {
     "name": "hypercart/query-guard",
     "description": "PHP-side circuit breaker for runaway MySQL queries on WordPress.",
-    "type": "wordpress-muplugin",
+    "type": "wordpress-plugin",
     "license": "GPL-2.0-or-later",
     "require": {
         "php": ">=7.4"

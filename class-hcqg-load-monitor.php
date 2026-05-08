@@ -68,7 +68,7 @@ if ( ! class_exists( 'HCQG_Load_Monitor' ) ) {
 				$thresholds = self::DEFAULT_THRESHOLDS;
 			}
 
-			$merged = array_merge( self::DEFAULT_THRESHOLDS, $thresholds );
+			$merged = array_merge( self::DEFAULT_THRESHOLDS, array_intersect_key( $thresholds, self::DEFAULT_THRESHOLDS ) );
 			foreach ( $merged as $key => $value ) {
 				$merged[ $key ] = max( 0, (int) $value );
 			}

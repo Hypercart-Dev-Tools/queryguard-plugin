@@ -106,6 +106,20 @@ if ( ! class_exists( 'HCQG_Mutex_Guard' ) ) {
 			);
 
 			$wpdb->query( $sql );
+
+			if ( ! empty( $wpdb->last_error ) ) {
+				self::log(
+					'error',
+					array(
+						'event'         => 'mutex_acquire_error',
+						'operation_key' => (string) $operation_key,
+						'option_name'   => $name,
+						'db_error'      => $wpdb->last_error,
+					)
+				);
+				return false;
+			}
+
 			$affected = (int) $wpdb->rows_affected;
 
 			// 1 = fresh INSERT, 2 = UPDATE replacing an expired lock,
@@ -144,6 +158,20 @@ if ( ! class_exists( 'HCQG_Mutex_Guard' ) ) {
 			);
 
 			$wpdb->query( $sql );
+
+			if ( ! empty( $wpdb->last_error ) ) {
+				self::log(
+					'error',
+					array(
+						'event'         => 'mutex_release_error',
+						'operation_key' => (string) $operation_key,
+						'option_name'   => $name,
+						'db_error'      => $wpdb->last_error,
+					)
+				);
+				return false;
+			}
+
 			$affected = (int) $wpdb->rows_affected;
 
 			if ( 0 === $affected ) {
@@ -305,11 +333,10 @@ if ( ! class_exists( 'HCQG_Mutex_Guard' ) ) {
 			try {
 				return bin2hex( random_bytes( self::NONCE_BYTES ) );
 			} catch ( Exception $e ) {
-				$out = '';
-				for ( $i = 0; $i < self::NONCE_BYTES * 2; $i++ ) {
-					$out .= dechex( mt_rand( 0, 15 ) );
+				if ( function_exists( 'openssl_random_pseudo_bytes' ) ) {
+					return bin2hex( openssl_random_pseudo_bytes( self::NONCE_BYTES ) );
 				}
-				return $out;
+				throw $e;
 			}
 		}
 
