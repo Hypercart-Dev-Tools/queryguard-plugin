@@ -27,6 +27,7 @@ Copy all plugin PHP files into `wp-content/mu-plugins/`:
 wp-content/mu-plugins/hypercart-query-guard.php
 wp-content/mu-plugins/class-hcqg-load-monitor.php
 wp-content/mu-plugins/class-hcqg-priority-registry.php
+wp-content/mu-plugins/class-hcqg-mutex-guard.php
 ```
 
 No activation step. MU-plugins load automatically.
@@ -123,6 +124,59 @@ add_filter( 'hypercart_query_guard_limit_ms', function( $ms, $context ) {
 }, 10, 2 );
 ```
 
+## Mutex Guard
+
+A standalone primitive that coalesces concurrent invocations of the same operation across all PHP workers and (when the database is shared) all hosts. Independent of the throttle subsystem. Use it when the failure mode is "the same expensive operation got started N times in parallel" — throttling can't help there because the issue isn't aggregate load, it's duplicate work.
+
+API on `HCQG_Mutex_Guard`:
+
+```php
+acquire_lock( string $operation_key, int $ttl = 60 ): string|false  // returns holder nonce or false
+release_lock( string $operation_key, string $holder_nonce ): bool
+peek_lock( string $operation_key ): array|false                     // monitoring only
+force_release( string $operation_key, string $reason ): bool        // admin/CLI recovery
+with_lock( string $operation_key, int $ttl, callable $work ): bool  // recommended for new callers
+```
+
+Typical use:
+
+```php
+HCQG_Mutex_Guard::with_lock( 'nofraud_admin_init_scan', 60, function () {
+    // expensive idempotent work — only one caller in the cohort runs this
+} );
+```
+
+Or manually if you need to thread the nonce yourself:
+
+```php
+$nonce = HCQG_Mutex_Guard::acquire_lock( 'rebuild_pricing_cache' );
+if ( false === $nonce ) {
+    return; // another worker is already doing it
+}
+try {
+    rebuild_pricing_cache();
+} finally {
+    HCQG_Mutex_Guard::release_lock( 'rebuild_pricing_cache', $nonce );
+}
+```
+
+### Caller patterns when `acquire_lock()` returns `false`
+
+| Pattern | Verdict | When |
+| --- | --- | --- |
+| Skip the work, serve a cached / stale result | ✅ Default | Idempotent reconciliations (NoFraud-style fraud-status sync, cache regeneration where stale data is acceptable) |
+| Schedule via Action Scheduler for later | ⚠️ Composes well | Work that must eventually run but doesn't have to run *now*. Pairs naturally with the Wave B per-action throttle. |
+| Busy-wait / poll-and-retry within the same request | ❌ Don't | Spin loops make the herd worse, exhaust PHP-FPM workers, and replicate exactly the failure mode the lock was meant to prevent. |
+
+### Storage and correctness notes
+
+- Storage is `wp_options` with `autoload = 'no'`. Transients are not used because they fall back to the object cache, which on managed hosts may be per-PHP-worker APCu — invisible to peer workers, so a transient-backed lock would silently let the herd thunder.
+- Acquire is atomic via `INSERT … ON DUPLICATE KEY UPDATE` in raw `$wpdb`. `add_option()` and `update_option()` are TOCTOU and are deliberately not used.
+- All time comparisons in SQL use PHP's `time()` as a `%d` parameter, never `UNIX_TIMESTAMP()`, so clock skew between web and DB nodes can't change the effective TTL.
+- `acquire_lock()` is **not** memoized per request. Each call hits the DB; that's intentional — memoization would create a same-process reentrancy hole that defeats the lock under contention.
+- Each lock value is `expires_at|nonce`. `release_lock()` and any future `refresh_lock()` are CAS-conditional on nonce match, so a process whose work overran TTL can't accidentally release the next holder's lock.
+- `option_name` is `hcqg_mutex_<md5($key)>` so caller keys can be arbitrary length without overflowing `wp_options.option_name`. The raw key flows through to log payloads for human-readable contention diagnostics.
+
 ## Logging
 
 If `Hypercart_Logger` (from the Hypercart Performance Monitor plugin) is present, log lines route through it. Otherwise the plugin falls back to `error_log()` with single-line JSON for `grep`-ability:
@@ -142,6 +196,9 @@ Event types:
 - **`as_action_deferral_skipped`** *(info)* — emitted when a defer is suppressed: `reason: max_defers_reached` after the per-(hook, args, group) defer cap is hit, or recurring schedules that the throttle refuses to interfere with.
 - **`as_action_defer_failed`** *(warn)* — emitted when `save_action()` returns 0 or throws while creating the deferred clone.
 - **`load_level_transition`** *(info)* — emitted when the throttle load level changes across requests.
+- **`mutex_held`** *(info)* — `acquire_lock()` returned `false` because a live lock was held by another worker.
+- **`mutex_release_skipped`** *(info)* — `release_lock()` was a no-op because the holder nonce didn't match (TTL overrun + replacement, or already deleted).
+- **`mutex_force_released`** *(warn)* — `force_release()` was invoked; payload includes the prior holder's nonce, the supplied reason, and the calling user.
 
 ## Limitations and caveats
 

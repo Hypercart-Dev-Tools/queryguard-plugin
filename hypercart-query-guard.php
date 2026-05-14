@@ -37,6 +37,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 require_once __DIR__ . '/class-hcqg-load-monitor.php';
 require_once __DIR__ . '/class-hcqg-priority-registry.php';
+require_once __DIR__ . '/class-hcqg-mutex-guard.php';
 
 if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 
@@ -386,7 +387,7 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 					'detector_mode'        => $decision['metrics']['detector_mode'],
 					'threads_running'      => $decision['metrics']['threads_running'],
 					'queue_depth'          => $decision['metrics']['queue_depth'],
-					'uri'                  => isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '',
+					'uri'                  => isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '',
 				)
 			);
 		}
@@ -475,7 +476,20 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 			if ( ! is_array( $policy ) ) {
 				return self::THROTTLE_POLICY;
 			}
-			return $policy;
+
+			$normalized = self::THROTTLE_POLICY;
+			foreach ( $normalized as $level => $fields ) {
+				if ( ! isset( $policy[ $level ] ) || ! is_array( $policy[ $level ] ) ) {
+					continue;
+				}
+				foreach ( $fields as $field => $default ) {
+					if ( isset( $policy[ $level ][ $field ] ) ) {
+						$normalized[ $level ][ $field ] = max( 0, (int) $policy[ $level ][ $field ] );
+					}
+				}
+			}
+
+			return $normalized;
 		}
 
 		/**
@@ -638,7 +652,6 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				}
 
 				$store->cancel_action( $action_id );
-				$store->unclaim_action( $action_id );
 
 				return $new_id;
 			} catch ( Throwable $e ) {
@@ -702,7 +715,7 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 
 		private static function defer_count_key( $hook, array $args, $group ) {
 			$encoded = function_exists( 'wp_json_encode' ) ? wp_json_encode( $args ) : json_encode( $args );
-			$hash    = hash( 'crc32', $hook . '|' . (string) $group . '|' . (string) $encoded );
+			$hash    = md5( $hook . '|' . (string) $group . '|' . (string) $encoded );
 			return self::DEFER_COUNT_KEY_PREFIX . $hash;
 		}
 
@@ -712,9 +725,17 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 
 		private static function increment_defer_count( $hook, array $args, $group ) {
 			$key   = self::defer_count_key( $hook, $args, $group );
-			$count = (int) wp_cache_get( $key, HCQG_Load_Monitor::CACHE_GROUP ) + 1;
-			wp_cache_set( $key, $count, HCQG_Load_Monitor::CACHE_GROUP, self::DEFER_COUNT_TTL );
-			return $count;
+			$group_key = HCQG_Load_Monitor::CACHE_GROUP;
+
+			wp_cache_add( $key, 0, $group_key, self::DEFER_COUNT_TTL );
+			$count = wp_cache_incr( $key, 1, $group_key );
+
+			if ( false === $count ) {
+				$count = (int) wp_cache_get( $key, $group_key ) + 1;
+				wp_cache_set( $key, $count, $group_key, self::DEFER_COUNT_TTL );
+			}
+
+			return (int) $count;
 		}
 
 		/**
@@ -743,7 +764,7 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				'errors'          => $decision['metrics']['errors'],
 				'blocked_reason'  => $decision['blocked_reason'],
 				'policy'          => $decision['policy'],
-				'uri'             => isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '',
+				'uri'             => isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '',
 			);
 
 			if ( self::THROTTLE_MODE_TEST_OBSERVE === $decision['effective_mode'] ) {
@@ -940,7 +961,7 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				'context'    => self::detect_context(),
 				'limit_ms'   => self::get_limit_ms(),
 				'last_query' => self::truncate( (string) $wpdb->last_query, 500 ),
-				'uri'        => isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '',
+				'uri'        => isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '',
 				'user_id'    => function_exists( 'get_current_user_id' ) ? get_current_user_id() : 0,
 				'time'       => time(),
 			);
@@ -1011,7 +1032,7 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 
 			$threshold_s = self::WARN_THRESHOLD_MS / 1000;
 			$context     = self::detect_context();
-			$uri         = isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '';
+			$uri         = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '';
 
 			foreach ( $wpdb->queries as $row ) {
 				// $row = [ $query, $duration_seconds, $callstack, $start_microtime, ... ]

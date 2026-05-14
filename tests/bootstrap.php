@@ -37,6 +37,78 @@ final class WP_Stub_State {
 	}
 }
 
+/**
+ * Minimal $wpdb stub. Real wpdb is intricate; we only model the surface
+ * the SUTs touch: ->options, ->prepare(), ->query(), ->get_var(),
+ * ->rows_affected. Tests configure return values via the next_* queues
+ * and inspect issued SQL via $queries.
+ */
+final class WP_Stub_DB {
+	/** @var string */
+	public $options = 'wp_options';
+	/** @var int */
+	public $rows_affected = 0;
+
+	/** @var array<int,string> Rendered SQL captured from query() / get_var(). */
+	public $queries = array();
+	/** @var array<int,array{query:string,args:array}> Raw args from prepare(). */
+	public $prepared = array();
+
+	/** @var array<int,int> FIFO queue of rows_affected returns for query(). */
+	public $next_query_rows_affected = array();
+	/** @var array<int,?string> FIFO queue of get_var() returns. */
+	public $next_get_var = array();
+
+	public function reset(): void {
+		$this->rows_affected            = 0;
+		$this->queries                  = array();
+		$this->prepared                 = array();
+		$this->next_query_rows_affected = array();
+		$this->next_get_var             = array();
+	}
+
+	/**
+	 * Substitute %s/%d/%f placeholders left-to-right with the supplied
+	 * args. This is a test-grade renderer, not a security-grade one —
+	 * we only need it to make the resulting SQL inspectable in assertions.
+	 */
+	public function prepare( $query, ...$args ) {
+		$this->prepared[] = array( 'query' => $query, 'args' => $args );
+
+		$rendered = $query;
+		foreach ( $args as $arg ) {
+			if ( ! preg_match( '/%[sdf]/', $rendered, $m, PREG_OFFSET_CAPTURE ) ) {
+				break;
+			}
+			$token = $m[0][0];
+			$pos   = $m[0][1];
+			if ( '%s' === $token ) {
+				$sub = "'" . str_replace( "'", "\\'", (string) $arg ) . "'";
+			} elseif ( '%d' === $token ) {
+				$sub = (string) (int) $arg;
+			} else {
+				$sub = (string) (float) $arg;
+			}
+			$rendered = substr_replace( $rendered, $sub, $pos, strlen( $token ) );
+		}
+		return $rendered;
+	}
+
+	public function query( $sql ) {
+		$this->queries[]     = $sql;
+		$this->rows_affected = empty( $this->next_query_rows_affected ) ? 0 : (int) array_shift( $this->next_query_rows_affected );
+		return $this->rows_affected;
+	}
+
+	public function get_var( $sql ) {
+		$this->queries[] = $sql;
+		if ( empty( $this->next_get_var ) ) {
+			return null;
+		}
+		return array_shift( $this->next_get_var );
+	}
+}
+
 if ( ! function_exists( 'apply_filters' ) ) {
 	function apply_filters( $tag, $value ) {
 		$args = func_get_args();
@@ -96,6 +168,28 @@ if ( ! function_exists( 'wp_cache_set' ) ) {
 	}
 }
 
+if ( ! function_exists( 'wp_cache_add' ) ) {
+	function wp_cache_add( $key, $value, $group = '', $expire = 0 ) {
+		$composite = $group . ':' . $key;
+		if ( array_key_exists( $composite, WP_Stub_State::$cache ) ) {
+			return false;
+		}
+		WP_Stub_State::$cache[ $composite ] = $value;
+		return true;
+	}
+}
+
+if ( ! function_exists( 'wp_cache_incr' ) ) {
+	function wp_cache_incr( $key, $offset = 1, $group = '' ) {
+		$composite = $group . ':' . $key;
+		if ( ! array_key_exists( $composite, WP_Stub_State::$cache ) ) {
+			return false;
+		}
+		WP_Stub_State::$cache[ $composite ] = (int) WP_Stub_State::$cache[ $composite ] + $offset;
+		return WP_Stub_State::$cache[ $composite ];
+	}
+}
+
 if ( ! function_exists( 'wp_using_ext_object_cache' ) ) {
 	function wp_using_ext_object_cache() {
 		return WP_Stub_State::$ext_object_cache;
@@ -139,6 +233,45 @@ if ( ! function_exists( 'is_admin' ) ) {
 	}
 }
 
+if ( ! function_exists( 'get_current_user_id' ) ) {
+	function get_current_user_id() {
+		return 0;
+	}
+}
+
+if ( ! function_exists( 'wp_unslash' ) ) {
+	function wp_unslash( $value ) {
+		return is_string( $value ) ? stripslashes( $value ) : $value;
+	}
+}
+
+if ( ! function_exists( 'sanitize_text_field' ) ) {
+	function sanitize_text_field( $str ) {
+		return is_string( $str ) ? trim( strip_tags( $str ) ) : '';
+	}
+}
+
+if ( ! function_exists( 'sanitize_key' ) ) {
+	function sanitize_key( $key ) {
+		return preg_replace( '/[^a-z0-9_\-]/', '', strtolower( $key ) );
+	}
+}
+
+if ( ! function_exists( 'esc_html' ) ) {
+	function esc_html( $text ) {
+		return htmlspecialchars( (string) $text, ENT_QUOTES, 'UTF-8' );
+	}
+}
+
+if ( ! function_exists( 'esc_html__' ) ) {
+	function esc_html__( $text, $domain = 'default' ) {
+		return esc_html( $text );
+	}
+}
+
+$GLOBALS['wpdb'] = new WP_Stub_DB();
+
 require_once __DIR__ . '/../class-hcqg-load-monitor.php';
 require_once __DIR__ . '/../class-hcqg-priority-registry.php';
+require_once __DIR__ . '/../class-hcqg-mutex-guard.php';
 require_once __DIR__ . '/../hypercart-query-guard.php';
