@@ -59,12 +59,46 @@ final class WP_Stub_DB {
 	/** @var array<int,?string> FIFO queue of get_var() returns. */
 	public $next_get_var = array();
 
+	// v2 drop-in simulation fields.
+	/** @var array Simulates HCQG_DB::$hcqg_slow_queries. */
+	public $hcqg_slow_queries = array();
+	/** @var bool Whether to simulate an active drop-in. */
+	private $hcqg_active = false;
+	/** @var int|null Last limit passed to hcqg_update_limit(). */
+	public $hcqg_last_limit = null;
+	/** @var mixed Simulated connection handle. */
+	public $dbh = null;
+	/** @var string */
+	public $last_error = '';
+	/** @var int */
+	public $num_queries = 0;
+
+	public function hcqg_is_active(): bool { return $this->hcqg_active; }
+	public function hcqg_set_active( bool $active ): void { $this->hcqg_active = $active; }
+	public function hcqg_update_limit( int $limit_ms ): void { $this->hcqg_last_limit = $limit_ms; }
+
+	/** @var bool */
+	private $suppress = false;
+
+	public function suppress_errors( $suppress = true ) {
+		$prev = $this->suppress;
+		$this->suppress = (bool) $suppress;
+		return $prev;
+	}
+
 	public function reset(): void {
 		$this->rows_affected            = 0;
 		$this->queries                  = array();
 		$this->prepared                 = array();
 		$this->next_query_rows_affected = array();
 		$this->next_get_var             = array();
+		$this->hcqg_slow_queries        = array();
+		$this->hcqg_active              = false;
+		$this->hcqg_last_limit          = null;
+		$this->dbh                      = null;
+		$this->last_error               = '';
+		$this->num_queries              = 0;
+		$this->suppress                 = false;
 	}
 
 	/**
@@ -267,6 +301,20 @@ if ( ! function_exists( 'esc_html__' ) ) {
 	function esc_html__( $text, $domain = 'default' ) {
 		return esc_html( $text );
 	}
+}
+
+/**
+ * Stub logger that captures calls so tests can inspect log output
+ * without relying on error_log() interception.
+ */
+class Hypercart_Logger {
+	/** @var array<int,array{level:string,channel:string,payload:array}> */
+	public static $calls = array();
+
+	public static function reset(): void { self::$calls = array(); }
+	public static function error( $channel, $payload ) { self::$calls[] = array( 'level' => 'error', 'channel' => $channel, 'payload' => $payload ); }
+	public static function info( $channel, $payload ) { self::$calls[] = array( 'level' => 'info', 'channel' => $channel, 'payload' => $payload ); }
+	public static function warn( $channel, $payload ) { self::$calls[] = array( 'level' => 'warn', 'channel' => $channel, 'payload' => $payload ); }
 }
 
 $GLOBALS['wpdb'] = new WP_Stub_DB();

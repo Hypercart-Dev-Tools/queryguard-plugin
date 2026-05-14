@@ -35,6 +35,21 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+$hcqg_required_files = array(
+	__DIR__ . '/class-hcqg-load-monitor.php',
+	__DIR__ . '/class-hcqg-priority-registry.php',
+	__DIR__ . '/class-hcqg-mutex-guard.php',
+);
+foreach ( $hcqg_required_files as $hcqg_file ) {
+	if ( ! file_exists( $hcqg_file ) ) {
+		if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+			error_log( '[hypercart_query_guard][error] Missing required file: ' . basename( $hcqg_file ) . ' — plugin disabled.' );
+		}
+		return;
+	}
+}
+unset( $hcqg_required_files, $hcqg_file );
+
 require_once __DIR__ . '/class-hcqg-load-monitor.php';
 require_once __DIR__ . '/class-hcqg-priority-registry.php';
 require_once __DIR__ . '/class-hcqg-mutex-guard.php';
@@ -160,6 +175,16 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		private static $throttle_runtime = array();
 
 		/**
+		 * Whether the v2 db.php drop-in is active for this request.
+		 *
+		 * @return bool
+		 */
+		private static function dropin_active() {
+			global $wpdb;
+			return ( isset( $wpdb ) && method_exists( $wpdb, 'hcqg_is_active' ) && $wpdb->hcqg_is_active() );
+		}
+
+		/**
 		 * Bootstrap.
 		 */
 		public static function init() {
@@ -182,27 +207,26 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				}
 			}
 
-			// Apply the SET SESSION early. Priority 1 on 'init' is as early as
-			// reliably available without a db.php drop-in.
 			if ( self::MODE_ENFORCE === $mode ) {
+				// v2 drop-in applies SET SESSION on first query (pre-init).
+				// We still hook init to refine the limit with the correct
+				// per-context tier (admin 45s, checkout 60s, etc.).
 				add_action( 'init', array( __CLASS__, 'apply_session_timeout' ), 1 );
 				add_action( 'rest_api_init', array( __CLASS__, 'apply_session_timeout' ), 1 );
 				add_action( 'admin_init', array( __CLASS__, 'apply_session_timeout' ), 1 );
 
-				// Catch the kill, log it, and surface a recovery notice in admin.
-				// The 'query' filter fires before each subsequent query, so we
-				// can capture the previous query's error before wpdb::flush()
-				// clears it. Without this, multiple kills in one request would
-				// collapse into a single log line (the last one). Shutdown is
-				// the fallback for the final query of the request.
 				add_filter( 'query', array( __CLASS__, 'capture_pending_kill_filter' ), 1 );
 				add_action( 'shutdown', array( __CLASS__, 'detect_and_log_kill' ), 0 );
 				add_action( 'admin_notices', array( __CLASS__, 'render_admin_search_notice' ) );
 			}
 
-			// Observe mode (and enforce mode, additively) logs slow queries via
-			// SAVEQUERIES. Sampled to keep memory overhead bounded.
-			if ( self::should_observe_queries( $mode ) ) {
+			// v2 drop-in: conditional backtracing at 100% replaces SAVEQUERIES.
+			// v1 fallback: SAVEQUERIES sampled at OBSERVE_SAMPLE_PCT.
+			if ( self::dropin_active() ) {
+				if ( self::MODE_OFF !== $mode ) {
+					add_action( 'shutdown', array( __CLASS__, 'log_slow_queries' ), 1 );
+				}
+			} elseif ( self::should_observe_queries( $mode ) ) {
 				if ( ! defined( 'SAVEQUERIES' ) ) {
 					define( 'SAVEQUERIES', true );
 				}
@@ -888,16 +912,27 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				return; // Unlimited contexts (WP-CLI, Action Scheduler).
 			}
 
+			// v2 drop-in: update the cached limit and re-apply via raw mysqli.
+			// This also caches the per-context limit so reconnect/rotation
+			// re-applies the correct tier instead of the pre-init default.
+			if ( self::dropin_active() ) {
+				static $dropin_last_limit = null;
+				if ( $dropin_last_limit === $limit_ms ) {
+					return;
+				}
+				$wpdb->hcqg_update_limit( $limit_ms );
+				$dropin_last_limit = $limit_ms;
+				return;
+			}
+
+			// v1 fallback.
 			static $last_dbh   = null;
 			static $last_limit = null;
 
-			// Skip the round-trip if both connection identity and limit are unchanged.
 			if ( $last_dbh === $wpdb->dbh && $last_limit === $limit_ms ) {
 				return;
 			}
 
-			// Suppress wpdb's own error reporting for the SET itself; if MySQL
-			// rejects it (very old version), we don't want to break the request.
 			$prev_suppress = $wpdb->suppress_errors( true );
 			$wpdb->query( $wpdb->prepare( 'SET SESSION MAX_EXECUTION_TIME = %d', $limit_ms ) );
 			$wpdb->suppress_errors( $prev_suppress );
@@ -1023,10 +1058,21 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		public static function log_slow_queries() {
 			global $wpdb;
 
-			if ( empty( $wpdb ) || ! defined( 'SAVEQUERIES' ) || ! SAVEQUERIES ) {
+			if ( empty( $wpdb ) ) {
 				return;
 			}
-			if ( empty( $wpdb->queries ) || ! is_array( $wpdb->queries ) ) {
+
+			// v2 drop-in populates hcqg_slow_queries (already filtered by threshold).
+			// v1 reads from $wpdb->queries (populated by SAVEQUERIES).
+			if ( self::dropin_active() ) {
+				$queries = $wpdb->hcqg_slow_queries;
+			} elseif ( defined( 'SAVEQUERIES' ) && SAVEQUERIES && ! empty( $wpdb->queries ) ) {
+				$queries = $wpdb->queries;
+			} else {
+				return;
+			}
+
+			if ( empty( $queries ) || ! is_array( $queries ) ) {
 				return;
 			}
 
@@ -1034,7 +1080,7 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 			$context     = self::detect_context();
 			$uri         = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '';
 
-			foreach ( $wpdb->queries as $row ) {
+			foreach ( $queries as $row ) {
 				// $row = [ $query, $duration_seconds, $callstack, $start_microtime, ... ]
 				if ( ! isset( $row[1] ) || $row[1] < $threshold_s ) {
 					continue;
