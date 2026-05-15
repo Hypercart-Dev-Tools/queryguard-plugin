@@ -1,5 +1,11 @@
 # Hypercart Query Guard
 
+## Quick test
+
+Append `?hcqg_test=1` to any URL while logged in as admin. This fires a 6-second `SELECT SLEEP(6)` that triggers the slow-query logging pipeline. Check `debug.log` (or your Hypercart_Logger output) for a `slow_query` event to confirm end-to-end operation.
+
+---
+
 A PHP-side circuit breaker for WordPress that enforces MySQL `MAX_EXECUTION_TIME` on read queries to prevent runaway `SELECT`s from saturating a managed-hosting pod.
 
 Built for high-volume WooCommerce stores on managed hosts (WP Engine, Pressable, Kinsta) where you don't have access to `pt-kill` or shell-level MySQL controls. Solves the failure mode where a single bad admin search, a stuck background sync, or an unindexed plugin query takes down the entire site by exhausting CPU and PHP-FPM workers.
@@ -243,6 +249,10 @@ Event types:
 - **Wave B caps deferrals per action signature.** A given (hook, args, group) is deferred at most 5 times within a 1-hour window before the throttle lets it run. Filter `hypercart_query_guard_max_defer_count` to tune. The cap is best-effort — counters live in the object cache and reset per request on hosts without a persistent cache.
 - **Each defer creates a new `wp_actionscheduler_actions` row.** The original is canceled, the deferred clone is pending in the future. Under sustained critical load this can grow the canceled-row population materially before AS pruning catches up. Monitor `wp_actionscheduler_actions` row counts during enforce-mode rollouts.
 - **Benchmark the queue-depth probe on large stores before enforce.** The due-queue-depth probe is cheap on a healthy `actionscheduler_actions` index, but it is still a real SQL query. Use `test_observe` first and inspect the logged probe timings before enabling `enforce`.
+
+## Future: single-file distribution
+
+The mu-plugin currently ships as four files. This keeps subsystems cleanly separated during development but creates deployment friction — partial uploads can fatal a site if the main file arrives before its companions (the dependency guard prevents this now, but the plugin silently disables itself until all files are present). A future improvement is a build step that concatenates all four files into a single `hypercart-query-guard.php` for distribution, eliminating upload-order concerns entirely.
 
 ## Architecture
 

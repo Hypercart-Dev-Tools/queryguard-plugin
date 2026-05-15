@@ -232,6 +232,20 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				}
 				add_action( 'shutdown', array( __CLASS__, 'log_slow_queries' ), 1 );
 			}
+
+			add_action( 'init', array( __CLASS__, 'maybe_run_diagnostic_query' ), 99 );
+		}
+
+		/**
+		 * Fire a SLEEP() query when ?hcqg_test=1 is present. Admin-only.
+		 * Triggers the slow-query logging pipeline for end-to-end validation.
+		 */
+		public static function maybe_run_diagnostic_query() {
+			if ( ! isset( $_GET['hcqg_test'] ) || ! current_user_can( 'manage_options' ) ) {
+				return;
+			}
+			global $wpdb;
+			$wpdb->query( 'SELECT SLEEP(6)' );
 		}
 
 		/**
