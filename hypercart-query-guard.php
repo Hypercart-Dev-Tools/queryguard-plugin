@@ -163,61 +163,15 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		);
 
 		/**
-		 * Default timeout matrix keyed by context then consequence tier.
+		 * Per-request timeout policy snapshot.
 		 *
-		 * Defaults intentionally mirror LIMITS_MS across every tier to keep
-		 * existing behavior unchanged until operators tune by tier.
+		 * `resolved_policy` is the most recent in-request context/tier/limit
+		 * calculation. `applied_policy` is the policy actually applied via
+		 * SET SESSION MAX_EXECUTION_TIME.
+		 *
+		 * @var array<string,mixed>
 		 */
-		const CONTEXT_CONSEQUENCE_LIMITS_MS = array(
-			'wp_cli'           => array(
-				'invisible'     => 0,
-				'retry_safe'    => 0,
-				'user_visible'  => 0,
-				'transactional' => 0,
-			),
-			'action_scheduler' => array(
-				'invisible'     => 0,
-				'retry_safe'    => 0,
-				'user_visible'  => 0,
-				'transactional' => 0,
-			),
-			'wp_cron'          => array(
-				'invisible'     => 10000,
-				'retry_safe'    => 10000,
-				'user_visible'  => 10000,
-				'transactional' => 10000,
-			),
-			'admin_ajax'       => array(
-				'invisible'     => 20000,
-				'retry_safe'    => 20000,
-				'user_visible'  => 20000,
-				'transactional' => 20000,
-			),
-			'rest_api'         => array(
-				'invisible'     => 30000,
-				'retry_safe'    => 30000,
-				'user_visible'  => 30000,
-				'transactional' => 30000,
-			),
-			'checkout'         => array(
-				'invisible'     => 60000,
-				'retry_safe'    => 60000,
-				'user_visible'  => 60000,
-				'transactional' => 60000,
-			),
-			'wp_admin'         => array(
-				'invisible'     => 45000,
-				'retry_safe'    => 45000,
-				'user_visible'  => 45000,
-				'transactional' => 45000,
-			),
-			'frontend'         => array(
-				'invisible'     => 30000,
-				'retry_safe'    => 30000,
-				'user_visible'  => 30000,
-				'transactional' => 30000,
-			),
-		);
+		private static $timeout_runtime = array();
 
 		/**
 		 * MySQL error code for query timeout (ER_QUERY_TIMEOUT).
@@ -941,6 +895,16 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		 * @return int Milliseconds. 0 = unlimited.
 		 */
 		private static function get_limit_ms() {
+			$policy = self::resolve_timeout_policy();
+			return (int) $policy['limit_ms'];
+		}
+
+		/**
+		 * Resolve timeout policy for current request.
+		 *
+		 * @return array<string,mixed>
+		 */
+		private static function resolve_timeout_policy() {
 			$context = self::detect_context();
 			$limits  = self::LIMITS_MS;
 
@@ -963,7 +927,52 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 			 * @param string $context  Detected context key.
 			 * @param string $consequence_tier Consequence tier key.
 			 */
-			return (int) apply_filters( 'hypercart_query_guard_limit_ms', $limit, $context, $consequence_tier );
+			$limit = (int) apply_filters( 'hypercart_query_guard_limit_ms', $limit, $context, $consequence_tier );
+
+			$policy = array(
+				'context'          => $context,
+				'consequence_tier' => $consequence_tier,
+				'limit_ms'         => $limit,
+			);
+
+			self::$timeout_runtime['resolved_policy'] = $policy;
+
+			return $policy;
+		}
+
+		/**
+		 * Resolve timeout policy for logging.
+		 *
+		 * In enforce mode, logs should reflect the policy actually applied to
+		 * MySQL with SET SESSION, not a late-request recomputation.
+		 *
+		 * @return array<string,mixed>
+		 */
+		private static function get_timeout_policy_for_logging() {
+			if ( isset( self::$timeout_runtime['applied_policy'] ) && is_array( self::$timeout_runtime['applied_policy'] ) ) {
+				return self::$timeout_runtime['applied_policy'];
+			}
+
+			return self::resolve_timeout_policy();
+		}
+
+		/**
+		 * Build the default context->tier timeout matrix from LIMITS_MS.
+		 *
+		 * LIMITS_MS is the single source of truth for default ceilings.
+		 *
+		 * @return array<string,array<string,int>>
+		 */
+		private static function get_default_context_consequence_limits_ms() {
+			$matrix = array();
+			foreach ( self::LIMITS_MS as $context => $limit ) {
+				$matrix[ $context ] = array();
+				foreach ( self::CONSEQUENCE_TIERS as $tier ) {
+					$matrix[ $context ][ $tier ] = (int) $limit;
+				}
+			}
+
+			return $matrix;
 		}
 
 		/**
@@ -978,13 +987,14 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		 * @return array<string,array<string,int>>
 		 */
 		private static function get_context_consequence_limits_ms() {
-			$filtered = apply_filters( 'hypercart_query_guard_context_consequence_limits_ms', self::CONTEXT_CONSEQUENCE_LIMITS_MS );
+			$defaults = self::get_default_context_consequence_limits_ms();
+			$filtered = apply_filters( 'hypercart_query_guard_context_consequence_limits_ms', $defaults );
 			if ( ! is_array( $filtered ) ) {
-				$filtered = self::CONTEXT_CONSEQUENCE_LIMITS_MS;
+				$filtered = $defaults;
 			}
 
 			$matrix = array();
-			foreach ( self::CONTEXT_CONSEQUENCE_LIMITS_MS as $context => $default_tiers ) {
+			foreach ( $defaults as $context => $default_tiers ) {
 				$source = $default_tiers;
 				if ( isset( $filtered[ $context ] ) && is_array( $filtered[ $context ] ) ) {
 					$source = array_merge( $default_tiers, $filtered[ $context ] );
@@ -1053,7 +1063,8 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				return;
 			}
 
-			$limit_ms = self::get_limit_ms();
+			$policy   = self::resolve_timeout_policy();
+			$limit_ms = (int) $policy['limit_ms'];
 			if ( 0 === $limit_ms ) {
 				return; // Unlimited contexts (WP-CLI, Action Scheduler).
 			}
@@ -1063,6 +1074,7 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 
 			// Skip the round-trip if both connection identity and limit are unchanged.
 			if ( $last_dbh === $wpdb->dbh && $last_limit === $limit_ms ) {
+				self::$timeout_runtime['applied_policy'] = $policy;
 				return;
 			}
 
@@ -1074,6 +1086,7 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 
 			$last_dbh   = $wpdb->dbh;
 			$last_limit = $limit_ms;
+			self::$timeout_runtime['applied_policy'] = $policy;
 		}
 
 		/**
@@ -1126,16 +1139,16 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				return;
 			}
 
-			$context = self::detect_context();
+			$policy  = self::get_timeout_policy_for_logging();
 			$payload = array(
-				'event'      => 'query_killed',
-				'context'    => $context,
-				'consequence_tier' => self::detect_consequence_tier( $context ),
-				'limit_ms'   => self::get_limit_ms(),
-				'last_query' => self::truncate( (string) $wpdb->last_query, 500 ),
-				'uri'        => isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '',
-				'user_id'    => function_exists( 'get_current_user_id' ) ? get_current_user_id() : 0,
-				'time'       => time(),
+				'event'            => 'query_killed',
+				'context'          => isset( $policy['context'] ) ? (string) $policy['context'] : self::detect_context(),
+				'consequence_tier' => isset( $policy['consequence_tier'] ) ? (string) $policy['consequence_tier'] : self::CONSEQUENCE_TIER_USER_VISIBLE,
+				'limit_ms'         => isset( $policy['limit_ms'] ) ? (int) $policy['limit_ms'] : self::get_limit_ms(),
+				'last_query'       => self::truncate( (string) $wpdb->last_query, 500 ),
+				'uri'              => isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '',
+				'user_id'          => function_exists( 'get_current_user_id' ) ? get_current_user_id() : 0,
+				'time'             => time(),
 			);
 
 			self::log( 'error', $payload );
@@ -1202,10 +1215,11 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				return;
 			}
 
-			$threshold_s      = self::WARN_THRESHOLD_MS / 1000;
-			$context          = self::detect_context();
-			$consequence_tier = self::detect_consequence_tier( $context );
-			$uri              = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '';
+			$threshold_s = self::WARN_THRESHOLD_MS / 1000;
+			$policy      = self::get_timeout_policy_for_logging();
+			$context     = isset( $policy['context'] ) ? (string) $policy['context'] : self::detect_context();
+			$tier        = isset( $policy['consequence_tier'] ) ? (string) $policy['consequence_tier'] : self::CONSEQUENCE_TIER_USER_VISIBLE;
+			$uri         = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '';
 
 			foreach ( $wpdb->queries as $row ) {
 				// $row = [ $query, $duration_seconds, $callstack, $start_microtime, ... ]
@@ -1217,7 +1231,7 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 					array(
 						'event'       => 'slow_query',
 						'context'     => $context,
-						'consequence_tier' => $consequence_tier,
+						'consequence_tier' => $tier,
 						'duration_ms' => (int) ( $row[1] * 1000 ),
 						'query'       => self::truncate( (string) $row[0], 500 ),
 						'caller'      => isset( $row[2] ) ? self::truncate( (string) $row[2], 500 ) : '',

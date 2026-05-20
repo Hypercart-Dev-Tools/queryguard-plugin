@@ -51,7 +51,9 @@ init priority 1 ─► apply_session_timeout() ──► SET SESSION MAX_EXECUTI
 
 The detected context maps to a ceiling via `LIMITS_MS` (e.g. `wp_admin: 45_000`, `rest_api: 30_000`, `action_scheduler: 0` = unlimited).
 
-Query timeout now carries a second dimension: consequence tier (`invisible`, `retry_safe`, `user_visible`, `transactional`). The timeout resolver computes context first, then resolves tier via `hypercart_query_guard_consequence_tier`, then applies the context × tier matrix from `hypercart_query_guard_context_consequence_limits_ms`. The defaults currently mirror legacy `LIMITS_MS` values across all tiers, so behavior is unchanged until tuned.
+Query timeout now carries a second dimension: consequence tier (`invisible`, `retry_safe`, `user_visible`, `transactional`). The timeout resolver computes context first, then resolves tier via `hypercart_query_guard_consequence_tier`, then applies the context × tier matrix from `hypercart_query_guard_context_consequence_limits_ms`. Default matrix values are generated from `LIMITS_MS` (single source of truth), so behavior is unchanged until tuned.
+
+Kill/slow-query telemetry prefers the timeout policy snapshot that was actually applied via `SET SESSION`, then falls back to live resolution only when no applied snapshot exists.
 
 ### Reconnect handling
 `apply_session_timeout()` memoizes `$wpdb->dbh` identity. When WPE / Kinsta rotate the MySQL connection mid-request, `$wpdb->dbh` becomes a new object, the identity check fails, and the timeout is re-applied automatically.

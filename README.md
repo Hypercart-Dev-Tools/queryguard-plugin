@@ -132,8 +132,9 @@ Default consequence tiers by context:
 | `wp-admin` | user_visible |
 | Checkout | transactional |
 
-Default matrix values currently mirror the legacy per-context limits across
-all tiers, so behavior is unchanged until you tune it.
+Default matrix values are generated from `LIMITS_MS` and currently mirror the
+legacy per-context limits across all tiers, so behavior is unchanged until you
+tune it.
 
 Consequence filters:
 
