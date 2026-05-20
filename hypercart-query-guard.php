@@ -1081,8 +1081,13 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 			// Suppress wpdb's own error reporting for the SET itself; if MySQL
 			// rejects it (very old version), we don't want to break the request.
 			$prev_suppress = $wpdb->suppress_errors( true );
-			$wpdb->query( $wpdb->prepare( 'SET SESSION MAX_EXECUTION_TIME = %d', $limit_ms ) );
+			$result        = $wpdb->query( $wpdb->prepare( 'SET SESSION MAX_EXECUTION_TIME = %d', $limit_ms ) );
 			$wpdb->suppress_errors( $prev_suppress );
+
+			if ( false === $result ) {
+				unset( self::$timeout_runtime['applied_policy'] );
+				return;
+			}
 
 			$last_dbh   = $wpdb->dbh;
 			$last_limit = $limit_ms;

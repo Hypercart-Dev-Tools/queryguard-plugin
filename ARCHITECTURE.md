@@ -151,7 +151,8 @@ The delimited shape (over JSON) makes `SUBSTRING_INDEX` extraction work on every
 
 | State | Lives in | TTL | Notes |
 | --- | --- | --- | --- |
-| Detected request context | static memo | request | Memoized by `apply_session_timeout()` via `$wpdb->dbh` identity |
+| Detected request context | computed on read | request | No dedicated memo; recomputed by resolver helpers |
+| Timeout policy snapshot | static memo on `Hypercart_Query_Guard` | request | `resolved_policy` records latest resolution; `applied_policy` set only after successful `SET SESSION` (or same-connection/same-limit short-circuit) |
 | Throttle decision | static memo on `Hypercart_Query_Guard` | request | One probe per request, regardless of how many queue-runner filters fire |
 | Load level + transition timestamp | persistent object cache → APCu → wp_options | `dwell × 4`, min 60s | Cross-request hysteresis state; option fallback is low-write (only written when level transitions) |
 | Defer count per (hook, args, group) | object cache | 1 hour | Best-effort cap; resets per-request on hosts without persistent caching |
