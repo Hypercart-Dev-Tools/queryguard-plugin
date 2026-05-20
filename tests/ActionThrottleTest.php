@@ -22,7 +22,9 @@ final class ActionThrottleTest extends TestCase {
 	 */
 	private function call( string $method, ...$args ) {
 		$ref = new ReflectionMethod( Hypercart_Query_Guard::class, $method );
-		$ref->setAccessible( true );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$ref->setAccessible( true );
+		}
 		return $ref->invoke( null, ...$args );
 	}
 

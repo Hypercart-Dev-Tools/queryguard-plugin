@@ -24,7 +24,9 @@ final class QueryConsequenceTest extends TestCase {
 	 */
 	private function call( string $method, ...$args ) {
 		$ref = new ReflectionMethod( Hypercart_Query_Guard::class, $method );
-		$ref->setAccessible( true );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$ref->setAccessible( true );
+		}
 		return $ref->invoke( null, ...$args );
 	}
 
@@ -38,7 +40,9 @@ final class QueryConsequenceTest extends TestCase {
 	private function setStatic( string $name, $value ): void {
 		$ref  = new ReflectionClass( Hypercart_Query_Guard::class );
 		$prop = $ref->getProperty( $name );
-		$prop->setAccessible( true );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$prop->setAccessible( true );
+		}
 		$prop->setValue( null, $value );
 	}
 

@@ -16,7 +16,9 @@ final class LoadMonitorTest extends TestCase {
 		$reflection = new ReflectionClass( HCQG_Load_Monitor::class );
 		foreach ( array( 'state_cache', 'cache_backend' ) as $name ) {
 			$prop = $reflection->getProperty( $name );
-			$prop->setAccessible( true );
+			if ( PHP_VERSION_ID < 80100 ) {
+				$prop->setAccessible( true );
+			}
 			$prop->setValue( null, null );
 		}
 	}
