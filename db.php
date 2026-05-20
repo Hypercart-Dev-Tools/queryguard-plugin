@@ -173,9 +173,7 @@ class HCQG_DB extends wpdb {
 			$limit_ms = 0;
 		}
 
-		if ( $limit_ms > 0 ) {
-			@mysqli_query( $this->dbh, sprintf( 'SET SESSION MAX_EXECUTION_TIME = %d', $limit_ms ) );
-		}
+		@mysqli_query( $this->dbh, sprintf( 'SET SESSION MAX_EXECUTION_TIME = %d', $limit_ms ) );
 
 		$this->hcqg_session_applied = true;
 		$this->hcqg_last_dbh        = $this->dbh;
@@ -201,9 +199,7 @@ class HCQG_DB extends wpdb {
 			return;
 		}
 
-		if ( $limit_ms > 0 ) {
-			@mysqli_query( $this->dbh, sprintf( 'SET SESSION MAX_EXECUTION_TIME = %d', $limit_ms ) );
-		}
+		@mysqli_query( $this->dbh, sprintf( 'SET SESSION MAX_EXECUTION_TIME = %d', $limit_ms ) );
 
 		$this->hcqg_last_dbh = $this->dbh;
 	}

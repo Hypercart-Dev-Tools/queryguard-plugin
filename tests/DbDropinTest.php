@@ -148,6 +148,23 @@ class DbDropinTest extends TestCase {
 		$this->assertSame( 30000, $wpdb->hcqg_last_limit );
 	}
 
+	public function test_apply_session_timeout_clears_limit_for_unlimited_context_when_dropin_active(): void {
+		$wpdb = $GLOBALS['wpdb'];
+		$wpdb->hcqg_set_active( true );
+		$wpdb->dbh = new stdClass();
+
+		add_filter(
+			'hypercart_query_guard_limit_ms',
+			static function () {
+				return 0;
+			}
+		);
+
+		Hypercart_Query_Guard::apply_session_timeout();
+
+		$this->assertSame( 0, $wpdb->hcqg_last_limit );
+	}
+
 	public function test_apply_session_timeout_v1_fallback_without_dropin(): void {
 		$wpdb = $GLOBALS['wpdb'];
 		$wpdb->hcqg_set_active( false );

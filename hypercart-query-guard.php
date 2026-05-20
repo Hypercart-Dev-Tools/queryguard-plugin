@@ -19,14 +19,10 @@
  *                    Modes: 'off' | 'test_observe' | 'observe' | 'enforce'
  *                    (default: 'off')
  *
- * Future v2:         Move SET SESSION application to a wp-content/db.php drop-in
- *                    so the autoloaded-options preload and everything on
- *                    muplugins_loaded / plugins_loaded / setup_theme is also
- *                    protected. v1 (this file) hooks 'init' priority 1, so
- *                    queries fired before then — wp_load_alloptions(),
- *                    auth/usermeta lookups, WC session bootstrap — run
- *                    without a ceiling. See README "Limitations and caveats"
- *                    for signals that indicate v2 is needed.
+ * v2 drop-in:        Optional wp-content/db.php applies SET SESSION at
+ *                    connection time and conditionally backtraces slow
+ *                    queries. Without the drop-in, this MU-plugin falls
+ *                    back to the v1 init-priority-1 behavior.
  *
  * @package Hypercart
  */
@@ -42,9 +38,7 @@ $hcqg_required_files = array(
 );
 foreach ( $hcqg_required_files as $hcqg_file ) {
 	if ( ! file_exists( $hcqg_file ) ) {
-		if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-			error_log( '[hypercart_query_guard][error] Missing required file: ' . basename( $hcqg_file ) . ' — plugin disabled.' );
-		}
+		error_log( '[hypercart_query_guard][error] Missing required file: ' . basename( $hcqg_file ) . ' - plugin disabled.' );
 		return;
 	}
 }
@@ -922,21 +916,20 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 			}
 
 			$limit_ms = self::get_limit_ms();
-			if ( 0 === $limit_ms ) {
-				return; // Unlimited contexts (WP-CLI, Action Scheduler).
-			}
-
-			// v2 drop-in: update the cached limit and re-apply via raw mysqli.
-			// This also caches the per-context limit so reconnect/rotation
-			// re-applies the correct tier instead of the pre-init default.
 			if ( self::dropin_active() ) {
 				static $dropin_last_limit = null;
 				if ( $dropin_last_limit === $limit_ms ) {
 					return;
 				}
+				// Delegate all limits, including 0, so unlimited contexts clear
+				// the pre-init default applied by the drop-in.
 				$wpdb->hcqg_update_limit( $limit_ms );
 				$dropin_last_limit = $limit_ms;
 				return;
+			}
+
+			if ( 0 === $limit_ms ) {
+				return; // Unlimited contexts (WP-CLI, Action Scheduler).
 			}
 
 			// v1 fallback.
