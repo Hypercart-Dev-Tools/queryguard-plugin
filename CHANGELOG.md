@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- **Consequence-tier-aware query timeout resolution.** Subsystem 1 now supports a second enforcement dimension beyond request context: consequence severity (`invisible`, `retry_safe`, `user_visible`, `transactional`). The resolver computes context, resolves tier via `hypercart_query_guard_consequence_tier`, then applies a context × tier timeout matrix via `hypercart_query_guard_context_consequence_limits_ms`, with final override still available through `hypercart_query_guard_limit_ms` (now receives the tier as a third argument). Defaults intentionally preserve existing behavior by mirroring legacy per-context limits across all tiers until tuned. `query_killed` and `slow_query` logs now include `consequence_tier` for rollout analysis. Includes PHPUnit coverage in `tests/QueryConsequenceTest.php` for tier resolution, matrix merge/clamp behavior, and final limit filtering.
+
 - **Phase 1 Action Scheduler throttle modes.** Query Guard now supports a separate `HYPERCART_QUERY_GUARD_THROTTLE_MODE` with `off`, `test_observe`, `observe`, and `enforce` modes. The throttle hooks Action Scheduler's web queue runner and can reduce batch size, time limit, and concurrent batches under load without changing the existing MySQL query-kill rollout model.
 
 - **Managed-host-safe load detection and capability logging.** The throttle probes `Threads_running` opportunistically, falls back to due queue depth from `actionscheduler_actions`, logs probe latency and signal availability, and records `load_level_transition`, `as_throttle_capability_test`, `as_throttle_observed`, and `as_throttle_applied` events for rollout analysis.

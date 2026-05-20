@@ -113,15 +113,58 @@ Limits are applied per request context. Override via the `hypercart_query_guard_
 | `wp-admin`           | 45 seconds      | Admin search/filter operations tolerated longer   |
 | Checkout             | 60 seconds      | Coupon validation, fraud checks, shipping calc    |
 
+### Consequence tiers
+
+Query timeout resolution now supports a second dimension: consequence severity.
+The plugin resolves a consequence tier per request, then applies the
+context × consequence timeout matrix.
+
+Default consequence tiers by context:
+
+| Context | Default consequence tier |
+| --- | --- |
+| WP-CLI | transactional |
+| Action Scheduler | retry_safe |
+| `wp-cron.php` | retry_safe |
+| `admin-ajax.php` | user_visible |
+| REST API | user_visible |
+| Frontend | user_visible |
+| `wp-admin` | user_visible |
+| Checkout | transactional |
+
+Default matrix values currently mirror the legacy per-context limits across
+all tiers, so behavior is unchanged until you tune it.
+
+Consequence filters:
+
+```php
+add_filter( 'hypercart_query_guard_consequence_tier', function( $tier, $context, $uri ) {
+    // Example: treat Subscriptions report cache updates as invisible.
+    if ( $context === 'action_scheduler' && strpos( $uri, 'wc_update_product_lookup_tables' ) !== false ) {
+        return 'invisible';
+    }
+    return $tier;
+}, 10, 3 );
+
+add_filter( 'hypercart_query_guard_context_consequence_limits_ms', function( $matrix ) {
+    // Aggressive ceilings for low-risk background contexts.
+    $matrix['action_scheduler']['invisible']  = 5000;
+    $matrix['action_scheduler']['retry_safe'] = 10000;
+    // More headroom for transactional contexts.
+    $matrix['checkout']['transactional']      = 90000;
+    return $matrix;
+} );
+```
+
 Filter example:
 
 ```php
-add_filter( 'hypercart_query_guard_limit_ms', function( $ms, $context ) {
+add_filter( 'hypercart_query_guard_limit_ms', function( $ms, $context, $consequence_tier ) {
     if ( $context === 'rest_api' && strpos( $_SERVER['REQUEST_URI'], 'klaviyo' ) !== false ) {
         return 15000; // tighter ceiling for Klaviyo specifically
     }
     return $ms;
-}, 10, 2 );
+}, 10, 3 );
 ```
 
 ## Mutex Guard
@@ -189,6 +232,9 @@ Event types:
 
 - **`slow_query`** *(warn)* — query exceeded 5s but completed; sampled in observe mode, always in enforce mode.
 - **`query_killed`** *(error)* — MySQL killed the query for hitting the limit; only emitted in enforce mode.
+
+`slow_query` and `query_killed` records include `consequence_tier` to support
+post-incident tuning of context × consequence limits.
 - **`as_throttle_capability_test`** *(info)* — emitted in `test_observe`; includes signal availability, cache backend, and probe timing.
 - **`as_throttle_observed`** *(info)* — emitted in throttle `observe`; logs the would-be Action Scheduler throttle decision.
 - **`as_throttle_applied`** *(info)* — emitted in throttle `enforce`; logs the effective Action Scheduler throttle decision.

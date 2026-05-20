@@ -51,6 +51,8 @@ init priority 1 ─► apply_session_timeout() ──► SET SESSION MAX_EXECUTI
 
 The detected context maps to a ceiling via `LIMITS_MS` (e.g. `wp_admin: 45_000`, `rest_api: 30_000`, `action_scheduler: 0` = unlimited).
 
+Query timeout now carries a second dimension: consequence tier (`invisible`, `retry_safe`, `user_visible`, `transactional`). The timeout resolver computes context first, then resolves tier via `hypercart_query_guard_consequence_tier`, then applies the context × tier matrix from `hypercart_query_guard_context_consequence_limits_ms`. The defaults currently mirror legacy `LIMITS_MS` values across all tiers, so behavior is unchanged until tuned.
+
 ### Reconnect handling
 `apply_session_timeout()` memoizes `$wpdb->dbh` identity. When WPE / Kinsta rotate the MySQL connection mid-request, `$wpdb->dbh` becomes a new object, the identity check fails, and the timeout is re-applied automatically.
 
@@ -192,7 +194,9 @@ These are the filters the rest of the codebase commits to keeping stable. Adding
 - `hypercart_query_guard_throttle_policy` — Wave A queue-runner caps per level
 - `hypercart_query_guard_action_delay_matrix` — Wave B (level × tier) → seconds
 - `hypercart_query_guard_max_defer_count` — per-signature defer cap
-- `hypercart_query_guard_limit_ms` — per-context query timeout (subsystem 1)
+- `hypercart_query_guard_limit_ms` — final query timeout after context + consequence resolution (subsystem 1)
+- `hypercart_query_guard_consequence_tier` — request consequence classification for subsystem 1
+- `hypercart_query_guard_context_consequence_limits_ms` — context × consequence timeout matrix for subsystem 1
 
 **Routing**
 - `hypercart_query_guard_priority_registry` — tier → patterns map
