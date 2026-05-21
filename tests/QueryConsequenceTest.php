@@ -13,6 +13,7 @@ final class QueryConsequenceTest extends TestCase {
 		WP_Stub_State::reset();
 		$_REQUEST = array();
 		$_SERVER  = array();
+		$this->setStatic( 'timeout_runtime', array() );
 	}
 
 	/**
@@ -44,6 +45,21 @@ final class QueryConsequenceTest extends TestCase {
 			$prop->setAccessible( true );
 		}
 		$prop->setValue( null, $value );
+	}
+
+	/**
+	 * Get a private static property from Hypercart_Query_Guard.
+	 *
+	 * @param string $name
+	 * @return mixed
+	 */
+	private function getStatic( string $name ) {
+		$ref  = new ReflectionClass( Hypercart_Query_Guard::class );
+		$prop = $ref->getProperty( $name );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$prop->setAccessible( true );
+		}
+		return $prop->getValue();
 	}
 
 	public function test_detect_consequence_tier_defaults_for_context(): void {
@@ -151,5 +167,52 @@ final class QueryConsequenceTest extends TestCase {
 		$this->assertSame( 'checkout', $policy['context'] );
 		$this->assertSame( 'transactional', $policy['consequence_tier'] );
 		$this->assertSame( 90000, $policy['limit_ms'] );
+	}
+
+	public function test_apply_session_timeout_failure_clears_applied_policy(): void {
+		global $wpdb;
+
+		$previous_wpdb = $wpdb;
+		$wpdb          = new class() {
+			public $dbh;
+			public $last_error = '';
+
+			public function __construct() {
+				$this->dbh = (object) array( 'id' => 'failing_connection' );
+			}
+
+			public function suppress_errors( $suppress = true ) {
+				return false;
+			}
+
+			public function prepare( $query, ...$args ) {
+				return vsprintf( str_replace( '%d', '%u', $query ), array_map( 'intval', $args ) );
+			}
+
+			public function query( $sql ) {
+				return false;
+			}
+		};
+
+		try {
+			$this->setStatic(
+				'timeout_runtime',
+				array(
+					'applied_policy' => array(
+						'context'          => 'checkout',
+						'consequence_tier' => 'transactional',
+						'limit_ms'         => 90000,
+					),
+				)
+			);
+
+			Hypercart_Query_Guard::apply_session_timeout();
+
+			$runtime = $this->getStatic( 'timeout_runtime' );
+			$this->assertIsArray( $runtime );
+			$this->assertArrayNotHasKey( 'applied_policy', $runtime );
+		} finally {
+			$wpdb = $previous_wpdb;
+		}
 	}
 }
