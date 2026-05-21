@@ -30,6 +30,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- **Structured logging now works with both legacy and string-only Hypercart_Logger APIs.** `Hypercart_Query_Guard` and `HCQG_Mutex_Guard` now inspect the logger method signature before emitting records: array-capable logger methods still receive the structured payload, while string-only methods receive JSON-serialized payloads. This prevents the Action Scheduler admin screen from fatalling when the installed `Hypercart_Logger` typehints its message argument as `string`, while preserving compatibility with the existing array-based test harness and drop-in logging assertions.
+
 - **Throttle probes now fail closed on non-MySQL db drop-ins instead of fatalling on PHP 8+.** `run_mysqli_query()` previously assumed `$wpdb->dbh` was always a native `mysqli` handle when `mysqli_query()` existed. On sites using a custom `db.php` drop-in with a different connection type (for example SQLite or custom routing layers), passing that handle into `mysqli_query()` could throw a fatal `TypeError` on PHP 8+. The probe now verifies `instanceof mysqli` before calling any `mysqli_*` API and degrades to a logged probe error when the connection is not native MySQLi.
 
 - **Action Scheduler workers no longer get the wrong execution-time ceiling.** `detect_context()` previously relied on `did_action('action_scheduler_before_process_queue')`, which has not yet fired at `init` priority 1 when `apply_session_timeout()` runs. Both AS transports were misclassified:
