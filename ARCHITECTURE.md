@@ -16,6 +16,7 @@ The subsystems share a request, a logger, and the request-context detection help
 
 ```
 hypercart-query-guard.php       # Plugin entrypoint + Hypercart_Query_Guard
+db.php                          # Optional wp-content/db.php drop-in (pre-init limits + conditional backtracing)
 class-hcqg-load-monitor.php     # HCQG_Load_Monitor (probes, hysteresis, persistence)
 class-hcqg-priority-registry.php # HCQG_Priority_Registry (hook → tier resolution)
 class-hcqg-mutex-guard.php      # HCQG_Mutex_Guard (atomic acquire/release on wp_options)
@@ -37,7 +38,9 @@ Why a class per subsystem:
 
 ### Lifecycle
 ```
-init priority 1 ─► apply_session_timeout() ──► SET SESSION MAX_EXECUTION_TIME = N
+db.php present  ─► HCQG_DB::query() first query ─► SET SESSION MAX_EXECUTION_TIME = default
+              │
+init priority 1 ─► apply_session_timeout() ──► SET SESSION MAX_EXECUTION_TIME = context ceiling
               │
               ├─► query filter ─► capture_pending_kill_filter() ─► capture_pending_kill()
               │   (runs before each subsequent wpdb::query, catches mid-request kills)
@@ -52,7 +55,9 @@ init priority 1 ─► apply_session_timeout() ──► SET SESSION MAX_EXECUTI
 The detected context maps to a ceiling via `LIMITS_MS` (e.g. `wp_admin: 45_000`, `rest_api: 30_000`, `action_scheduler: 0` = unlimited).
 
 ### Reconnect handling
-`apply_session_timeout()` memoizes `$wpdb->dbh` identity. When WPE / Kinsta rotate the MySQL connection mid-request, `$wpdb->dbh` becomes a new object, the identity check fails, and the timeout is re-applied automatically.
+Without the drop-in, `apply_session_timeout()` memoizes `$wpdb->dbh` identity. When WPE / Kinsta rotate the MySQL connection mid-request, `$wpdb->dbh` becomes a new object, the identity check fails, and the timeout is re-applied automatically.
+
+With the v2 `db.php` drop-in, `HCQG_DB` applies the pre-init default on the first query, then the MU-plugin calls `hcqg_update_limit()` at `init` with the resolved context ceiling. A ceiling of `0` means unlimited and is explicitly applied so contexts such as Action Scheduler clear the pre-init default.
 
 ### Multi-kill capture
 A naïve "log on shutdown" approach loses every kill except the last, because each subsequent `wpdb::query()` overwrites `$wpdb->last_error`. The `query` filter captures pending errors before the next query clears them, and a `$wpdb->num_queries` high-water mark makes the capture idempotent so the NoFraud thundering-herd pattern (multiple kills with the same error string) is correctly counted as distinct events.

@@ -1,5 +1,11 @@
 # Hypercart Query Guard
 
+## Quick test
+
+Append `?hcqg_test=1` to any URL while logged in as admin. This fires a 6-second `SELECT SLEEP(6)` that triggers the slow-query logging pipeline. Check `debug.log` (or your Hypercart_Logger output) for a `slow_query` event to confirm end-to-end operation.
+
+---
+
 A PHP-side circuit breaker for WordPress that enforces MySQL `MAX_EXECUTION_TIME` on read queries to prevent runaway `SELECT`s from saturating a managed-hosting pod.
 
 Built for high-volume WooCommerce stores on managed hosts (WP Engine, Pressable, Kinsta) where you don't have access to `pt-kill` or shell-level MySQL controls. Solves the failure mode where a single bad admin search, a stuck background sync, or an unindexed plugin query takes down the entire site by exhausting CPU and PHP-FPM workers.
@@ -21,16 +27,39 @@ Built for high-volume WooCommerce stores on managed hosts (WP Engine, Pressable,
 
 ## Installation
 
-Copy all plugin PHP files into `wp-content/mu-plugins/`:
+### MU-plugin (required)
+
+Copy **all four** PHP files into `wp-content/mu-plugins/`. All four must be present — if any companion file is missing, the plugin logs a warning and disables itself rather than crashing the site.
 
 ```text
-wp-content/mu-plugins/hypercart-query-guard.php
-wp-content/mu-plugins/class-hcqg-load-monitor.php
-wp-content/mu-plugins/class-hcqg-priority-registry.php
-wp-content/mu-plugins/class-hcqg-mutex-guard.php
+wp-content/mu-plugins/class-hcqg-load-monitor.php      ← copy first
+wp-content/mu-plugins/class-hcqg-priority-registry.php  ← copy first
+wp-content/mu-plugins/class-hcqg-mutex-guard.php        ← copy first
+wp-content/mu-plugins/hypercart-query-guard.php          ← copy last
 ```
 
-No activation step. MU-plugins load automatically.
+**Upload order matters on live sites.** WordPress loads mu-plugins on every request with no activation step. Copy the three `class-hcqg-*.php` files first, then `hypercart-query-guard.php` last. If a request arrives after the main file is uploaded but before the companions, and the companions are missing, the plugin will safely disable itself for that request.
+
+### db.php drop-in (optional, recommended)
+
+The v2 drop-in extends `wpdb` to provide two capabilities the mu-plugin alone cannot:
+
+1. **Early-query coverage** — applies `SET SESSION MAX_EXECUTION_TIME` at connection time, before `wp_load_alloptions()` and other pre-`init` queries.
+2. **Zero-overhead observation** — replaces WordPress core's `SAVEQUERIES` (which calls `debug_backtrace()` on every query unconditionally) with conditional backtracing that only captures slow queries. This drops the CPU cost of 100% observation from ~10% to near zero.
+
+Copy `db.php` to `wp-content/`:
+
+```text
+wp-content/db.php
+```
+
+The drop-in is independent of the mu-plugin and has no file dependencies. It can be installed before, after, or without the mu-plugin:
+
+- **db.php present, mu-plugin present** — full v2 behavior. The mu-plugin detects the drop-in and uses it for logging and tiered limit updates.
+- **db.php present, mu-plugin absent** — drop-in runs standalone. Conditional backtracing and SET SESSION protection are active, but there is no structured logging, no tiered limits, and no admin-search fallback notice.
+- **db.php absent, mu-plugin present** — v1 behavior. The mu-plugin hooks `init` at priority 1 and uses `SAVEQUERIES` for observation.
+
+**Note:** WordPress only supports one `wp-content/db.php` at a time. If another plugin (e.g., Query Monitor) has installed a db.php, you must remove it first. Query Monitor's db.php forces `SAVEQUERIES = true` on every request — even when QM is deactivated — adding ~10% CPU overhead with no benefit if QM isn't actively in use.
 
 ## Configuration
 
@@ -220,6 +249,10 @@ Event types:
 - **Wave B caps deferrals per action signature.** A given (hook, args, group) is deferred at most 5 times within a 1-hour window before the throttle lets it run. Filter `hypercart_query_guard_max_defer_count` to tune. The cap is best-effort — counters live in the object cache and reset per request on hosts without a persistent cache.
 - **Each defer creates a new `wp_actionscheduler_actions` row.** The original is canceled, the deferred clone is pending in the future. Under sustained critical load this can grow the canceled-row population materially before AS pruning catches up. Monitor `wp_actionscheduler_actions` row counts during enforce-mode rollouts.
 - **Benchmark the queue-depth probe on large stores before enforce.** The due-queue-depth probe is cheap on a healthy `actionscheduler_actions` index, but it is still a real SQL query. Use `test_observe` first and inspect the logged probe timings before enabling `enforce`.
+
+## Future: single-file distribution
+
+The mu-plugin currently ships as four files. This keeps subsystems cleanly separated during development but creates deployment friction — partial uploads can fatal a site if the main file arrives before its companions (the dependency guard prevents this now, but the plugin silently disables itself until all files are present). A future improvement is a build step that concatenates all four files into a single `hypercart-query-guard.php` for distribution, eliminating upload-order concerns entirely.
 
 ## Architecture
 
