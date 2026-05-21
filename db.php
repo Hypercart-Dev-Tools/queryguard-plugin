@@ -36,7 +36,7 @@ class HCQG_DB extends wpdb {
 	// the vtable). If core refactors _do_query into a protected method or
 	// changes query()'s signature, the assertion below will fire.
 	const WP_VERSION_FLOOR   = '5.5';
-	const WP_VERSION_CEILING = '6.9';
+	const WP_VERSION_CEILING = '7.0';
 
 	/**
 	 * Slow queries captured by conditional backtracing.
