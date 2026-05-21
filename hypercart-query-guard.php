@@ -1115,22 +1115,93 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		 * @param array  $payload Structured fields.
 		 */
 		private static function log( $level, array $payload ) {
+			$message = self::encode_log_payload( $payload );
+
 			if ( class_exists( 'Hypercart_Logger' ) ) {
 				if ( 'error' === $level && method_exists( 'Hypercart_Logger', 'error' ) ) {
-					Hypercart_Logger::error( 'query_guard', $payload );
+					Hypercart_Logger::error( 'query_guard', self::get_logger_payload_for_method( 'Hypercart_Logger', 'error', $payload, $message ) );
 					return;
 				}
 				if ( 'info' === $level && method_exists( 'Hypercart_Logger', 'info' ) ) {
-					Hypercart_Logger::info( 'query_guard', $payload );
+					Hypercart_Logger::info( 'query_guard', self::get_logger_payload_for_method( 'Hypercart_Logger', 'info', $payload, $message ) );
 					return;
 				}
 				if ( method_exists( 'Hypercart_Logger', 'warn' ) ) {
-					Hypercart_Logger::warn( 'query_guard', $payload );
+					Hypercart_Logger::warn( 'query_guard', self::get_logger_payload_for_method( 'Hypercart_Logger', 'warn', $payload, $message ) );
 					return;
 				}
 			}
 			// Fallback: structured single-line JSON for grep-ability.
-			error_log( '[hypercart_query_guard][' . $level . '] ' . wp_json_encode( $payload ) );
+			error_log( '[hypercart_query_guard][' . $level . '] ' . $message );
+		}
+
+		/**
+		 * Preserve structured payloads for legacy logger signatures while
+		 * serializing for string-only logger APIs.
+		 *
+		 * @param string $class_name
+		 * @param string $method
+		 * @param array  $payload
+		 * @param string $message
+		 * @return array|string
+		 */
+		private static function get_logger_payload_for_method( $class_name, $method, array $payload, $message ) {
+			try {
+				$reflection = new ReflectionMethod( $class_name, $method );
+				$params     = $reflection->getParameters();
+				if ( ! isset( $params[1] ) ) {
+					return $message;
+				}
+
+				if ( self::reflection_type_allows_array( $params[1]->getType() ) ) {
+					return $payload;
+				}
+			} catch ( ReflectionException $exception ) {
+				return $message;
+			}
+
+			return $message;
+		}
+
+		/**
+		 * Determine whether a reflected parameter type accepts array payloads.
+		 *
+		 * @param ReflectionType|null $type
+		 * @return bool
+		 */
+		private static function reflection_type_allows_array( $type ) {
+			if ( null === $type ) {
+				return true;
+			}
+
+			if ( $type instanceof ReflectionNamedType ) {
+				return in_array( $type->getName(), array( 'array', 'iterable', 'mixed' ), true );
+			}
+
+			if ( $type instanceof ReflectionUnionType ) {
+				foreach ( $type->getTypes() as $union_type ) {
+					if ( self::reflection_type_allows_array( $union_type ) ) {
+						return true;
+					}
+				}
+			}
+
+			return false;
+		}
+
+		/**
+		 * Serialize structured payloads for string-only logger sinks.
+		 *
+		 * @param array $payload Structured fields.
+		 * @return string
+		 */
+		private static function encode_log_payload( array $payload ) {
+			$encoded = function_exists( 'wp_json_encode' ) ? wp_json_encode( $payload ) : json_encode( $payload );
+			if ( is_string( $encoded ) ) {
+				return $encoded;
+			}
+
+			return '[hypercart_query_guard] failed to encode log payload';
 		}
 
 		/**
