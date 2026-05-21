@@ -7,9 +7,9 @@
 
 use PHPUnit\Framework\TestCase;
 
-	final class HCQG_String_Logger {
-		public static function info( string $channel, string $message ): void {}
-	}
+final class HCQG_String_Logger {
+	public static function info( string $channel, string $message ): void {}
+}
 
 final class LoggingTest extends TestCase {
 
@@ -27,6 +27,24 @@ final class LoggingTest extends TestCase {
 		$ref = new ReflectionMethod( Hypercart_Query_Guard::class, $method );
 		$ref->setAccessible( true );
 		return $ref->invoke( null, ...$args );
+	}
+
+	/**
+	 * @return array<string,mixed>
+	 */
+	private function run_fixture( string $fixture ): array {
+		$command = escapeshellarg( PHP_BINARY ) . ' ' . escapeshellarg( __DIR__ . '/fixtures/' . $fixture ) . ' 2>&1';
+		$output  = array();
+		$exit    = 0;
+
+		exec( $command, $output, $exit );
+
+		$this->assertSame( 0, $exit, implode( "\n", $output ) );
+
+		$result = json_decode( implode( "\n", $output ), true );
+		$this->assertIsArray( $result, implode( "\n", $output ) );
+
+		return $result;
 	}
 
 	public function test_log_serializes_payload_for_hypercart_logger(): void {
@@ -60,5 +78,14 @@ final class LoggingTest extends TestCase {
 		);
 
 		$this->assertSame( wp_json_encode( $payload ), $result );
+	}
+
+	public function test_log_dispatches_json_to_string_only_logger_end_to_end(): void {
+		$result = $this->run_fixture( 'string-logger-integration.php' );
+
+		$this->assertCount( 1, $result['calls'] );
+		$this->assertSame( 'query_guard', $result['calls'][0]['channel'] );
+		$this->assertSame( 'info', $result['calls'][0]['level'] );
+		$this->assertSame( wp_json_encode( $result['payload'] ), $result['calls'][0]['payload'] );
 	}
 }
