@@ -1,1 +1,9 @@
 /.claude
+/vendor
+PROJECT/.DS_Store
+composer.lock
+PROJECT/1-INBOX/.DS_Store
+PROJECT/2-WORKING/.DS_Store
+PROJECT/3-DONE/.DS_Store
+PROJECT/4-MISC/.DS_Store
+.phpunit.result.cache
