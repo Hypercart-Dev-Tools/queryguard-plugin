@@ -414,6 +414,12 @@ if ( ! class_exists( 'HCQG_Mutex_Guard' ) ) {
 					Hypercart_Logger::info( 'query_guard', self::get_logger_payload_for_method( 'Hypercart_Logger', 'info', $payload, $encoded ) );
 					return;
 				}
+				// The Hypercart Helper logger exposes warning(); older/string-only
+				// loggers may expose warn(). Prefer warning(), fall back to warn().
+				if ( method_exists( 'Hypercart_Logger', 'warning' ) ) {
+					Hypercart_Logger::warning( 'query_guard', self::get_logger_payload_for_method( 'Hypercart_Logger', 'warning', $payload, $encoded ) );
+					return;
+				}
 				if ( method_exists( 'Hypercart_Logger', 'warn' ) ) {
 					Hypercart_Logger::warn( 'query_guard', self::get_logger_payload_for_method( 'Hypercart_Logger', 'warn', $payload, $encoded ) );
 					return;

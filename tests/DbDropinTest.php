@@ -63,7 +63,7 @@ class DbDropinTest extends TestCase {
 		Hypercart_Query_Guard::log_slow_queries();
 
 		$this->assertCount( 1, Hypercart_Logger::$calls );
-		$this->assertSame( 'warn', Hypercart_Logger::$calls[0]['level'] );
+		$this->assertSame( 'warning', Hypercart_Logger::$calls[0]['level'] );
 		$this->assertSame( 'slow_query', Hypercart_Logger::$calls[0]['payload']['event'] );
 		$this->assertSame( 6500, Hypercart_Logger::$calls[0]['payload']['duration_ms'] );
 	}

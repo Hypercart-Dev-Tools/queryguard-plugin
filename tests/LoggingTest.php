@@ -62,6 +62,22 @@ final class LoggingTest extends TestCase {
 		$this->assertSame( $payload, Hypercart_Logger::$calls[0]['payload'] );
 	}
 
+	public function test_warn_level_routes_to_hypercart_logger_warning(): void {
+		// Regression: slow_query events are emitted at 'warn' level. The Helper
+		// plugin's logger exposes warning(), not warn(); the bridge must map to it.
+		$payload = array(
+			'event'       => 'slow_query',
+			'duration_ms' => 14777,
+		);
+
+		$this->call( 'log', 'warn', $payload );
+
+		$this->assertCount( 1, Hypercart_Logger::$calls );
+		$this->assertSame( 'query_guard', Hypercart_Logger::$calls[0]['channel'] );
+		$this->assertSame( 'warning', Hypercart_Logger::$calls[0]['level'] );
+		$this->assertSame( $payload, Hypercart_Logger::$calls[0]['payload'] );
+	}
+
 	public function test_string_only_logger_methods_receive_json_payload(): void {
 		$payload = array(
 			'event' => 'as_throttle_observed',
