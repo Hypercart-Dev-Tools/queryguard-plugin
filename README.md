@@ -208,7 +208,7 @@ try {
 
 ## Logging
 
-If `Hypercart_Logger` (from the Hypercart Performance Monitor plugin) is present, the plugin keeps the structured payload for array-capable logger methods and JSON-serializes it only for string-only logger signatures. Otherwise the plugin falls back to `error_log()` with single-line JSON for `grep`-ability:
+If `Hypercart_Logger` (from the Hypercart Helper plugin) is present, the plugin keeps the structured payload for array-capable logger methods and JSON-serializes it only for string-only logger signatures. Otherwise the plugin falls back to `error_log()` with single-line JSON for `grep`-ability:
 
 ```
 [hypercart_query_guard][error] {"event":"query_killed","context":"admin_ajax","limit_ms":20000,"last_query":"SELECT * FROM wp_nf_transactions WHERE meta_key = '_nofraud_transaction_status_workaround'","uri":"/wp-admin/admin-ajax.php","user_id":0,"time":1745875234}
