@@ -89,7 +89,9 @@ if ( ! function_exists( 'get_current_user_id' ) ) {
 }
 
 if ( ! function_exists( 'wp_json_encode' ) ) {
+	$GLOBALS['_qg_last_encoded'] = null;
 	function wp_json_encode( $data, $options = 0, $depth = 512 ) {
+		$GLOBALS['_qg_last_encoded'] = $data;
 		return json_encode( $data, $options, $depth );
 	}
 }
