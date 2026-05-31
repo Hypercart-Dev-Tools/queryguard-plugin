@@ -3,7 +3,7 @@
  * Plugin Name:       Hypercart Query Guard
  * Plugin URI:        https://hypercart.io
  * Description:       PHP-side circuit breaker that enforces MySQL MAX_EXECUTION_TIME on read queries to prevent runaway SELECTs from saturating the pod. Tiered limits per request context, observe-mode for safe rollout, automatic re-application on connection rotation, and admin-search timeout fallback.
- * Version:           1.0.0
+ * Version:           1.1.0
  * Author:            Hypercart / Neochrome
  * License:           GPL-2.0-or-later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
@@ -63,7 +63,16 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 			'wp_cli'           => 0,
 			'action_scheduler' => 0,
 			'wp_cron'          => 10000,
-			'admin_ajax'       => 20000,
+			// Tightened from 20 s → 10 s (2026-05-30).
+			// admin-ajax.php is the dominant vector for runaway read queries (Facebook
+			// background sync, WC order-note loading via oversized IN lists, NoFraud).
+			// Halving the ceiling halves the per-execution DB exposure when concurrent
+			// workers pile up. Legitimate heavyweight reads that truly need > 10 s should
+			// use the REST API (30 s ceiling) or be routed through WP-Admin (45 s ceiling).
+			// Operators can relax for specific actions via the hypercart_query_guard_limit_ms
+			// filter. The checkout context (60 s) is unchanged — it is detected before
+			// admin_ajax and covers both the AJAX and block REST checkout endpoints.
+			'admin_ajax'       => 10000,
 			'rest_api'         => 30000,
 			'checkout'         => 60000,
 			'wp_admin'         => 45000,
@@ -271,6 +280,14 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		}
 
 		/**
+		 * Threshold for classifying an IN-list as "large". Queries with an IN
+		 * clause containing this many or more items are flagged in log payloads.
+		 * Typical WordPress IN lists (get_posts with specific IDs, WC item rows)
+		 * stay well under 50; anything above 200 is unusual enough to log.
+		 */
+		const LARGE_IN_LIST_THRESHOLD = 200;
+
+		/**
 		 * High-water mark for the last query number we've already inspected
 		 * for a kill. wpdb::$num_queries is monotonic, so comparing against
 		 * it lets us distinguish "fresh error from a new query" from "stale
@@ -332,14 +349,24 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				return;
 			}
 
+			$uri            = isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '';
+			$classification = self::classify_sql( (string) $wpdb->last_query );
+
 			$payload = array(
-				'event'      => 'query_killed',
-				'context'    => self::detect_context(),
-				'limit_ms'   => self::get_limit_ms(),
-				'last_query' => self::truncate( (string) $wpdb->last_query, 500 ),
-				'uri'        => isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '',
-				'user_id'    => function_exists( 'get_current_user_id' ) ? get_current_user_id() : 0,
-				'time'       => time(),
+				'event'                        => 'query_killed',
+				'context'                      => self::detect_context(),
+				'limit_ms'                     => self::get_limit_ms(),
+				'last_query'                   => self::truncate( (string) $wpdb->last_query, 500 ),
+				'uri'                          => $uri,
+				'user_id'                      => function_exists( 'get_current_user_id' ) ? get_current_user_id() : 0,
+				'time'                         => time(),
+				'is_admin_ajax'                => self::is_admin_ajax_request( $uri ),
+				'table_hint'                   => $classification['table_hint'],
+				'is_comment_query'             => $classification['is_comment_query'],
+				'has_large_in_list'            => $classification['has_large_in_list'],
+				'estimated_in_list_size'       => $classification['estimated_in_list_size'],
+				'is_probable_woocommerce'      => $classification['is_probable_woocommerce'],
+				'is_probable_order_note_query' => $classification['is_probable_order_note_query'],
 			);
 
 			self::log( 'error', $payload );
@@ -415,18 +442,117 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				if ( ! isset( $row[1] ) || $row[1] < $threshold_s ) {
 					continue;
 				}
+				$query_sql      = (string) $row[0];
+				$classification = self::classify_sql( $query_sql );
 				self::log(
 					'warn',
 					array(
-						'event'       => 'slow_query',
-						'context'     => $context,
-						'duration_ms' => (int) ( $row[1] * 1000 ),
-						'query'       => self::truncate( (string) $row[0], 500 ),
-						'caller'      => isset( $row[2] ) ? self::truncate( (string) $row[2], 500 ) : '',
-						'uri'         => $uri,
+						'event'                        => 'slow_query',
+						'context'                      => $context,
+						'duration_ms'                  => (int) ( $row[1] * 1000 ),
+						'query'                        => self::truncate( $query_sql, 500 ),
+						'caller'                       => isset( $row[2] ) ? self::truncate( (string) $row[2], 500 ) : '',
+						'uri'                          => $uri,
+						'is_admin_ajax'                => self::is_admin_ajax_request( $uri ),
+						'table_hint'                   => $classification['table_hint'],
+						'is_comment_query'             => $classification['is_comment_query'],
+						'has_large_in_list'            => $classification['has_large_in_list'],
+						'estimated_in_list_size'       => $classification['estimated_in_list_size'],
+						'is_probable_woocommerce'      => $classification['is_probable_woocommerce'],
+						'is_probable_order_note_query' => $classification['is_probable_order_note_query'],
 					)
 				);
 			}
+		}
+
+		/**
+		 * Classify a SQL string for incident-visibility fields. Returns an array
+		 * of cheap, safe heuristics derived from plain string operations.
+		 * Only classifies reads (SELECT); writes return all-default values because
+		 * MAX_EXECUTION_TIME cannot kill writes by MySQL design.
+		 *
+		 * Returned keys:
+		 *   table_hint                   – 'wp_comments' when the table appears in the SQL, else ''
+		 *   is_comment_query             – true when table_hint === 'wp_comments'
+		 *   has_large_in_list            – true when an IN list has >= LARGE_IN_LIST_THRESHOLD items
+		 *   estimated_in_list_size       – item count (commas + 1) of the first IN list found, else 0
+		 *   is_probable_woocommerce      – true when WC table / keyword hints are found
+		 *   is_probable_order_note_query – true when it's a wp_comments query with 'order_note'
+		 *
+		 * @param string $sql Raw SQL string (unsanitised, read-only inspection).
+		 * @return array<string, mixed>
+		 */
+		public static function classify_sql( $sql ) {
+			$result = array(
+				'table_hint'                   => '',
+				'is_comment_query'             => false,
+				'has_large_in_list'            => false,
+				'estimated_in_list_size'       => 0,
+				'is_probable_woocommerce'      => false,
+				'is_probable_order_note_query' => false,
+			);
+
+			if ( ! is_string( $sql ) || '' === $sql ) {
+				return $result;
+			}
+
+			// Only classify reads; writes can't be killed by MAX_EXECUTION_TIME anyway.
+			if ( 0 !== strncasecmp( ltrim( $sql ), 'SELECT', 6 ) ) {
+				return $result;
+			}
+
+			// ---- Table hint: wp_comments ----
+			if ( false !== stripos( $sql, 'wp_comments' ) ) {
+				$result['table_hint']       = 'wp_comments';
+				$result['is_comment_query'] = true;
+			}
+
+			// ---- Large IN list ----
+			// preg_match locates 'IN (' robustly with no backtracking risk; the body
+			// is then measured with substr_count (O(n), no regex engine needed).
+			if ( preg_match( '/\bIN\s*\(/i', $sql, $in_match, PREG_OFFSET_CAPTURE ) ) {
+				$open       = $in_match[0][1] + strlen( $in_match[0][0] );
+				$scan_limit = min( strlen( $sql ) - $open, 524288 ); // cap at 512 KB
+				$body_chunk = substr( $sql, $open, $scan_limit );
+				$close      = strpos( $body_chunk, ')' );
+				if ( false !== $close ) {
+					$in_body                          = substr( $body_chunk, 0, $close );
+					$commas                           = substr_count( $in_body, ',' );
+					$result['estimated_in_list_size'] = $commas + 1;
+					$result['has_large_in_list']      = ( $result['estimated_in_list_size'] >= self::LARGE_IN_LIST_THRESHOLD );
+				}
+			}
+
+			// ---- WooCommerce heuristics ----
+			foreach ( array( 'woocommerce', 'wc_order', "post_type = 'shop_order'", "post_type='shop_order'" ) as $needle ) {
+				if ( false !== stripos( $sql, $needle ) ) {
+					$result['is_probable_woocommerce'] = true;
+					break;
+				}
+			}
+
+			// ---- Order-note heuristic ----
+			// WC stores order notes as wp_comments rows with comment_type = 'order_note'.
+			// The query that caused the May 2026 production incident was exactly this shape.
+			if (
+				$result['is_comment_query'] &&
+				( false !== stripos( $sql, 'order_note' ) || false !== stripos( $sql, 'order-note' ) )
+			) {
+				$result['is_probable_order_note_query'] = true;
+				$result['is_probable_woocommerce']      = true;
+			}
+
+			return $result;
+		}
+
+		/**
+		 * Return true when the given request URI routes through admin-ajax.php.
+		 *
+		 * @param string $uri Value of $_SERVER['REQUEST_URI'].
+		 * @return bool
+		 */
+		public static function is_admin_ajax_request( $uri ) {
+			return false !== strpos( (string) $uri, 'admin-ajax.php' );
 		}
 
 		/**
@@ -438,6 +564,16 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		 * @param array  $payload Structured fields.
 		 */
 		private static function log( $level, array $payload ) {
+			/**
+			 * Filter the structured log payload before emission. Use this hook to
+			 * add custom fields, route to additional sinks, or intercept payloads
+			 * in integration tests.
+			 *
+			 * @param array  $payload Log fields.
+			 * @param string $level   'warn' | 'error'
+			 */
+			$payload = (array) apply_filters( 'hypercart_query_guard_log_payload', $payload, $level );
+
 			if ( class_exists( 'Hypercart_Logger' ) ) {
 				if ( 'error' === $level && method_exists( 'Hypercart_Logger', 'error' ) ) {
 					Hypercart_Logger::error( 'query_guard', $payload );
