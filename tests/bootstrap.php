@@ -240,9 +240,11 @@ if ( ! function_exists( 'add_action' ) ) {
 	}
 }
 
+$GLOBALS['_qg_last_encoded'] = null;
 if ( ! function_exists( 'wp_json_encode' ) ) {
-	function wp_json_encode( $data ) {
-		return json_encode( $data );
+	function wp_json_encode( $data, $options = 0, $depth = 512 ) {
+		$GLOBALS['_qg_last_encoded'] = $data;
+		return json_encode( $data, $options, $depth );
 	}
 }
 

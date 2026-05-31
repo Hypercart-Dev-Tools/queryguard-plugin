@@ -1179,18 +1179,28 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 			}
 
 			// ---- Large IN list ----
-			// preg_match locates 'IN (' robustly with no backtracking risk; the body
-			// is then measured with substr_count (O(n), no regex engine needed).
-			if ( preg_match( '/\bIN\s*\(/i', $sql, $in_match, PREG_OFFSET_CAPTURE ) ) {
-				$open       = $in_match[0][1] + strlen( $in_match[0][0] );
-				$scan_limit = min( strlen( $sql ) - $open, 524288 ); // cap at 512 KB
-				$body_chunk = substr( $sql, $open, $scan_limit );
-				$close      = strpos( $body_chunk, ')' );
-				if ( false !== $close ) {
-					$in_body                          = substr( $body_chunk, 0, $close );
-					$commas                           = substr_count( $in_body, ',' );
-					$result['estimated_in_list_size'] = $commas + 1;
-					$result['has_large_in_list']      = ( $result['estimated_in_list_size'] >= self::LARGE_IN_LIST_THRESHOLD );
+			// preg_match_all finds every IN ( in the query so that an earlier
+			// subquery IN (...) cannot mask a later large literal list — the
+			// exact failure mode of the May 2026 incident pattern. We keep the
+			// largest list found. Each body is measured with substr_count (O(n),
+			// no regex backtracking).
+			if ( preg_match_all( '/\bIN\s*\(/i', $sql, $in_matches, PREG_OFFSET_CAPTURE ) ) {
+				$max_size = 0;
+				foreach ( $in_matches[0] as $in_match ) {
+					$open       = $in_match[1] + strlen( $in_match[0] );
+					$scan_limit = min( strlen( $sql ) - $open, 524288 ); // cap at 512 KB
+					$body_chunk = substr( $sql, $open, $scan_limit );
+					$close      = strpos( $body_chunk, ')' );
+					if ( false !== $close ) {
+						$commas = substr_count( substr( $body_chunk, 0, $close ), ',' );
+						if ( $commas + 1 > $max_size ) {
+							$max_size = $commas + 1;
+						}
+					}
+				}
+				if ( $max_size > 0 ) {
+					$result['estimated_in_list_size'] = $max_size;
+					$result['has_large_in_list']      = ( $max_size >= self::LARGE_IN_LIST_THRESHOLD );
 				}
 			}
 
@@ -1235,9 +1245,9 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		 * @param array  $payload Structured fields.
 		 */
 		private static function log( $level, array $payload ) {
-			$payload = apply_filters( 'hypercart_query_guard_log_payload', $payload, $level );
-			if ( ! is_array( $payload ) || empty( $payload ) ) {
-				return;
+			$filtered = apply_filters( 'hypercart_query_guard_log_payload', $payload, $level );
+			if ( is_array( $filtered ) && ! empty( $filtered ) ) {
+				$payload = $filtered;
 			}
 			$message = self::encode_log_payload( $payload );
 

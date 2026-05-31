@@ -289,4 +289,37 @@ class PayloadFieldsTest extends \PHPUnit\Framework\TestCase {
 		$this->assertFalse( $this->captured['is_probable_woocommerce'] );
 		$this->assertFalse( $this->captured['is_probable_order_note_query'] );
 	}
+
+	// -----------------------------------------------------------------------
+	// Log filter safety — null-return regression (filter cast fix)
+	// A hook callback that forgets return $payload must not reduce the payload
+	// to [] and silently drop all structured fields.
+	// -----------------------------------------------------------------------
+
+	public function test_filter_callback_returning_null_preserves_original_payload() {
+		global $wpdb;
+		$wpdb = $this->mock_killed_wpdb( 'SELECT ID FROM wp_posts WHERE post_status = \'publish\'', 80 );
+		$this->reset_kill_counter();
+		$GLOBALS['_qg_last_encoded'] = null;
+
+		// Register a badly-written filter that omits return $payload.
+		// This returns null; (array) null would have been [] before the fix.
+		add_filter(
+			'hypercart_query_guard_log_payload',
+			function ( $payload ) {
+				// Intentionally omits: return $payload;
+			}
+		);
+
+		Hypercart_Query_Guard::detect_and_log_kill();
+
+		// wp_json_encode is our bootstrap stub and records the last argument it
+		// received — i.e. the payload $log() actually emitted. If the null-return
+		// guard is working, this must be the original payload, not [].
+		$emitted = $GLOBALS['_qg_last_encoded'];
+		$this->assertNotNull( $emitted, 'log() must still emit when a filter returns null' );
+		$this->assertNotEmpty( $emitted, 'payload must not be reduced to [] by a null-return filter' );
+		$this->assertArrayHasKey( 'event', $emitted );
+		$this->assertSame( 'query_killed', $emitted['event'] );
+	}
 }

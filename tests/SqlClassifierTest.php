@@ -212,6 +212,39 @@ class SqlClassifierTest extends \PHPUnit\Framework\TestCase {
 	}
 
 	// -----------------------------------------------------------------------
+	// classify_sql — subquery masking regression (preg_match_all fix)
+	// A query whose first IN ( is a small subquery must still surface the
+	// large literal list that follows it.
+	// -----------------------------------------------------------------------
+
+	public function test_large_in_list_not_masked_by_earlier_subquery_in() {
+		// First IN ( is a subquery with no commas; second IN ( is the 10k ID list.
+		// The old preg_match would stop at the subquery and return size=1.
+		$ids = implode( ', ', range( 1, 500 ) );
+		$sql = "SELECT * FROM wp_comments
+				 WHERE comment_type IN (SELECT slug FROM wp_term_taxonomy WHERE taxonomy = 'comment_type')
+				 AND comment_ID IN ({$ids})";
+		$r   = Hypercart_Query_Guard::classify_sql( $sql );
+
+		$this->assertTrue( $r['has_large_in_list'], 'large literal list masked by earlier subquery IN' );
+		$this->assertSame( 500, $r['estimated_in_list_size'] );
+		$this->assertTrue( $r['is_comment_query'] );
+	}
+
+	public function test_small_subquery_in_before_large_list_reports_max_size() {
+		// Subquery IN with a small comma list (3 items), then a big literal list.
+		// estimated_in_list_size must reflect the larger one.
+		$ids = implode( ', ', range( 1, 300 ) );
+		$sql = "SELECT * FROM wp_comments
+				 WHERE comment_type IN ('order_note', 'note', 'status')
+				 AND comment_ID IN ({$ids})";
+		$r   = Hypercart_Query_Guard::classify_sql( $sql );
+
+		$this->assertTrue( $r['has_large_in_list'] );
+		$this->assertSame( 300, $r['estimated_in_list_size'] );
+	}
+
+	// -----------------------------------------------------------------------
 	// is_admin_ajax_request
 	// -----------------------------------------------------------------------
 
