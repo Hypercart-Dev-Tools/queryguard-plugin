@@ -136,7 +136,7 @@ Limits are applied per request context. Override via the `hypercart_query_guard_
 | WP-CLI               | unlimited       | Long-running migrations, imports                  |
 | Action Scheduler     | unlimited       | Background workers, writes anyway                 |
 | `wp-cron.php`        | 10 seconds      | Cron should never be slow; cheap signal           |
-| `admin-ajax.php`     | 20 seconds      | Most spike vectors live here (FB sync, NoFraud)   |
+| `admin-ajax.php`     | 10 seconds      | Most spike vectors live here (FB sync, WC order-note IN lists, NoFraud). Tightened from 20 s to reduce per-execution DB exposure; heavyweight reads should use REST API or `wp-admin` instead. |
 | REST API             | 30 seconds      | Klaviyo polling, WC REST `/orders`                |
 | Frontend (default)   | 30 seconds      | Product pages, my-account                         |
 | `wp-admin`           | 45 seconds      | Admin search/filter operations tolerated longer   |
@@ -216,7 +216,7 @@ If `Hypercart_Logger` (from the Hypercart Performance Monitor plugin) is present
 
 Event types:
 
-- **`slow_query`** *(warn)* — query exceeded 5s but completed; sampled in observe mode, always in enforce mode.
+- **`slow_query`** *(warn)* — query exceeded 5 s but completed; sampled in observe mode, always in enforce mode.
 - **`query_killed`** *(error)* — MySQL killed the query for hitting the limit; only emitted in enforce mode.
 - **`as_throttle_capability_test`** *(info)* — emitted in `test_observe`; includes signal availability, cache backend, and probe timing.
 - **`as_throttle_observed`** *(info)* — emitted in throttle `observe`; logs the would-be Action Scheduler throttle decision.
@@ -228,6 +228,40 @@ Event types:
 - **`mutex_held`** *(info)* — `acquire_lock()` returned `false` because a live lock was held by another worker.
 - **`mutex_release_skipped`** *(info)* — `release_lock()` was a no-op because the holder nonce didn't match (TTL overrun + replacement, or already deleted).
 - **`mutex_force_released`** *(warn)* — `force_release()` was invoked; payload includes the prior holder's nonce, the supplied reason, and the calling user.
+
+### SQL classification fields
+
+Both events carry additional classification fields derived from cheap, safe string inspection of the SQL. These fields are designed for post-incident filtering and alerting.
+
+| Field | Type | Description |
+|---|---|---|
+| `is_admin_ajax` | bool | `true` when the request URI routes through `admin-ajax.php` |
+| `table_hint` | string | `'wp_comments'` when that table appears in the SQL, else `''` |
+| `is_comment_query` | bool | `true` when `table_hint === 'wp_comments'` |
+| `has_large_in_list` | bool | `true` when the SQL contains an `IN (…)` list with ≥ 200 items |
+| `estimated_in_list_size` | int | Comma count + 1 inside the first `IN (…)` found; `0` if none |
+| `is_probable_woocommerce` | bool | `true` when WooCommerce table/keyword hints are present |
+| `is_probable_order_note_query` | bool | `true` when the query targets `wp_comments` and mentions `order_note` (WC stores order notes as comment rows) |
+
+The classifier only runs on `SELECT` statements; writes return all-default values. No SQL mutation occurs.
+
+### Filtering the log payload
+
+A `hypercart_query_guard_log_payload` filter fires before each log emission. Use it to add custom fields, route to additional sinks, or tighten alerting:
+
+```php
+add_filter( 'hypercart_query_guard_log_payload', function( $payload, $level ) {
+    // Page-level alert for killed order-note queries from admin-ajax.
+    if (
+        $level === 'error' &&
+        $payload['is_probable_order_note_query'] &&
+        $payload['is_admin_ajax']
+    ) {
+        my_pagerduty_alert( $payload );
+    }
+    return $payload;
+}, 10, 2 );
+```
 
 ## Limitations and caveats
 
@@ -258,9 +292,32 @@ The mu-plugin currently ships as four files. This keeps subsystems cleanly separ
 
 For an engineering-level overview of how the plugin is put together — subsystem boundaries, the throttle decision pipeline, cross-request state model, mode matrix, public filter surface, and the testing approach — see [ARCHITECTURE.md](ARCHITECTURE.md).
 
+## Enforce-mode rollout recommendation
+
+For stores exposed to high-frequency admin-ajax traffic (WooCommerce order management, background syncs, order-note loading):
+
+1. **Start in observe mode for at least 48 hours.** Watch for `slow_query` events with `is_admin_ajax: true`, `is_comment_query: true`, or `has_large_in_list: true`. These identify the queries that enforce mode will kill.
+2. **Check Action Scheduler detection.** If you see `slow_query` events with `context: admin_ajax` from queries you know are AS workers, verify the AS action names in `detect_context()` match your version. The static memo in `apply_session_timeout()` locks in the tier on first call; a mis-detected AS worker gets a 10 s ceiling for the rest of that request.
+3. **Enable enforce mode.** Set `define( 'HYPERCART_QUERY_GUARD_MODE', 'enforce' )` in `wp-config.php`. Monitor `query_killed` events for 24 hours. Any killed query with `event: query_killed`, `is_probable_order_note_query: true`, `has_large_in_list: true`, and `is_admin_ajax: true` is the exact failure mode this plugin was hardened for.
+4. **If a legitimate endpoint needs > 10 s,** use the limit filter to relax that specific action — do not raise the global `admin_ajax` ceiling:
+
+```php
+add_filter( 'hypercart_query_guard_limit_ms', function( $ms, $context ) {
+    if ( $context === 'admin_ajax' && isset( $_REQUEST['action'] ) ) {
+        // Relax only for the specific WC AJAX action that legitimately needs more time.
+        if ( $_REQUEST['action'] === 'my_slow_but_necessary_action' ) {
+            return 30000;
+        }
+    }
+    return $ms;
+}, 10, 2 );
+```
+
 ## Origin
 
 Built in response to a CPU-saturation incident on a high-volume WooCommerce store where a single Facebook background sync query (`SELECT … FROM wp_comments WHERE comment_ID IN (… 10,010 items …)`) running concurrently with itself took down the whole pod. The kill switch is the cheapest insurance against that class of failure: a few hours of work, indefinite payoff.
+
+On 2026-05-30 a production store suffered the same shape of incident via WooCommerce order-note loading: `comment_ID IN (… 10,639 IDs …)` fired repeatedly through `admin-ajax.php`, consumed large DB time per execution, and generated repeated `MySQL server has gone away` errors. The SQL classification fields and 10 s `admin_ajax` ceiling were added in response.
 
 ## License
 
