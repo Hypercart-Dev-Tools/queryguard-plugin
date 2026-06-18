@@ -4,6 +4,14 @@ All notable changes to Hypercart Query Guard are documented here.
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Every merged build carries a version number.
 
+## [1.2.0] — 2026-06-17
+
+### Added
+
+- **Order-notes caller probe (opt-in diagnostic).** A new `pre_get_comments` hook identifies the originating caller of the "order-notes mega-query" — the unindexed `SELECT wp_comments.* … WHERE comment_ID IN ( … ~11,000 IDs … )` produced when WooCommerce's `wc_get_order_notes()` is invoked without an `order_id`/`order__in`, loading every order note on the site in one cache-prime (scanning ~9M rows, growing without bound). The existing `slow_query`/`query_killed` classifier flags *that* such a query ran, but the slow-query caller field stops at `wc-order-functions.php`; this probe fires before the query executes and records a full `wp_debug_backtrace_summary()` so the upstream caller (plugin/column/export omitting the order scope) can be named. Emits a `warn`-level `order_notes_unscoped` event with `context`, `action`, `uri`, `referer`, `limit`, and `caller`.
+
+- **`HYPERCART_QUERY_GUARD_LOG_ORDER_NOTES` constant.** Gates the probe; off unless defined truthy in `wp-config.php`. Also overridable via the new `hypercart_query_guard_log_order_notes` filter. When disabled, the hook is never registered (zero overhead). Volume is bounded three ways: non-order-note comment queries return immediately, *scoped* per-order loads are ignored (only the unscoped whole-table load is logged), and a per-request cap (`ORDER_NOTES_LOG_MAX_PER_REQUEST`, default 5) guards against a looping caller.
+
 ## [1.1.0] — 2026-05-30
 
 ### Changed
