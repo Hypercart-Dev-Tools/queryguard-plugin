@@ -3,7 +3,7 @@
  * Plugin Name:       Hypercart Query Guard
  * Plugin URI:        https://hypercart.io
  * Description:       PHP-side circuit breaker that enforces MySQL MAX_EXECUTION_TIME on read queries to prevent runaway SELECTs from saturating the pod. Tiered limits per request context, observe-mode for safe rollout, automatic re-application on connection rotation, and admin-search timeout fallback.
- * Version:           1.1.0
+ * Version:           1.2.0
  * Author:            Hypercart / Neochrome
  * License:           GPL-2.0-or-later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
@@ -23,6 +23,20 @@
  *                    connection time and conditionally backtraces slow
  *                    queries. Without the drop-in, this MU-plugin falls
  *                    back to the v1 init-priority-1 behavior.
+ *
+ * Cart diagnostic:   define( 'HYPERCART_CART_TYPE_DIAGNOSTIC', true );
+ *                    Traces non-numeric cart item values (quantity, price,
+ *                    discounted_price) that cause the PHP 8 TypeError in
+ *                    WC_Discounts::sort_by_price(). Emits two error events:
+ *                    'cart_type_corruption' (hook-window detection with
+ *                    origin attribution and callback lists) and
+ *                    'cart_fatal_captured' (shutdown-time capture of the
+ *                    fatal itself, on any code path). Override via the
+ *                    'hypercart_cart_type_diagnostic_enabled' filter from
+ *                    wp-config.php or an earlier-loading mu-plugin. All
+ *                    entry points swallow Throwables — the tracer can
+ *                    never take down the cart it observes. Log volume is
+ *                    capped per process with per-signature de-duplication.
  *
  * @package Hypercart
  */
@@ -178,6 +192,46 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		private static $throttle_runtime = array();
 
 		/**
+		 * Cart type diagnostic: maximum corruption events logged per PHP
+		 * process. Bounded so a corrupted cart cannot flood the log, yet
+		 * high enough that a long-running process (an Action Scheduler
+		 * batch touching many carts) can report several distinct findings.
+		 */
+		const CART_DIAG_MAX_LOGS = 5;
+
+		/**
+		 * Cart type diagnostic: early snapshot of cart item values,
+		 * keyed by cart item key.
+		 *
+		 * @var array<string, array>
+		 */
+		private static $cart_diag_snapshot = array();
+
+		/**
+		 * Cart type diagnostic: corruption events logged by this process.
+		 *
+		 * @var int
+		 */
+		private static $cart_diag_log_count = 0;
+
+		/**
+		 * Cart type diagnostic: signatures of corruption sets already
+		 * logged, so repeat hook firings do not re-log identical findings.
+		 *
+		 * @var array<string, bool>
+		 */
+		private static $cart_diag_logged_sigs = array();
+
+		/**
+		 * Cart type diagnostic: true while a snapshot/check pair is in
+		 * flight; guards re-entrant calculate_totals() calls from
+		 * overwriting the outer snapshot mid-hook.
+		 *
+		 * @var bool
+		 */
+		private static $cart_diag_in_progress = false;
+
+		/**
 		 * Whether the v2 db.php drop-in is active for this request.
 		 *
 		 * @return bool
@@ -191,6 +245,22 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		 * Bootstrap.
 		 */
 		public static function init() {
+			// Cart type diagnostic — independent of query guard mode.
+			if ( self::cart_diag_enabled() ) {
+				// PHP_INT_MIN/PHP_INT_MAX bracket the widest window a WP hook
+				// allows: priority-0/negative callbacks still run after the
+				// snapshot, and "run last" callbacks still run before the check.
+				add_action( 'woocommerce_before_calculate_totals', array( __CLASS__, 'cart_diag_snapshot' ), PHP_INT_MIN, 1 );
+				add_action( 'woocommerce_before_calculate_totals', array( __CLASS__, 'cart_diag_check' ), PHP_INT_MAX, 1 );
+
+				// The sort_by_price() fatal also fires on paths that never run
+				// woocommerce_before_calculate_totals (WC_Cart::apply_coupon()
+				// validates via `new WC_Discounts( WC()->cart )` before any
+				// totals calculation), so capture the fatal itself at shutdown
+				// regardless of code path.
+				register_shutdown_function( array( __CLASS__, 'cart_diag_shutdown_capture' ) );
+			}
+
 			$mode          = self::get_mode();
 			$throttle_mode = self::get_throttle_mode();
 
@@ -1234,6 +1304,536 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		 */
 		public static function is_admin_ajax_request( $uri ) {
 			return false !== strpos( (string) $uri, 'admin-ajax.php' );
+		}
+
+		// ================================================================
+		// Cart Type Diagnostic
+		// ================================================================
+
+		/**
+		 * Whether the cart type diagnostic is enabled.
+		 *
+		 * Constant-first with a filter override, mirroring the throttle
+		 * gating pattern. Evaluated once at mu-plugin load, so a filter
+		 * override must be registered from wp-config.php or an
+		 * earlier-loading mu-plugin.
+		 *
+		 * @return bool
+		 */
+		private static function cart_diag_enabled() {
+			$enabled = defined( 'HYPERCART_CART_TYPE_DIAGNOSTIC' ) && HYPERCART_CART_TYPE_DIAGNOSTIC;
+			if ( function_exists( 'apply_filters' ) ) {
+				$enabled = (bool) apply_filters( 'hypercart_cart_type_diagnostic_enabled', $enabled );
+			}
+			return $enabled;
+		}
+
+		/**
+		 * Early snapshot (priority PHP_INT_MIN): record cart item quantity,
+		 * price, and discounted_price before other hook callbacks run.
+		 *
+		 * All diagnostic entry points swallow Throwables: this code runs on
+		 * production checkout against data known to be malformed in unknown
+		 * ways, and must never become a fatal of its own.
+		 *
+		 * @param WC_Cart|mixed $cart
+		 */
+		public static function cart_diag_snapshot( $cart ) {
+			try {
+				self::cart_diag_snapshot_body( $cart );
+			} catch ( Throwable $t ) {
+				self::cart_diag_note_internal_failure( $t );
+			}
+		}
+
+		/**
+		 * Late check (priority PHP_INT_MAX): compare current cart item
+		 * values against the early snapshot and log every non-numeric
+		 * quantity/price/discounted_price with origin attribution and the
+		 * callback lists needed to identify the offending plugin.
+		 *
+		 * @param WC_Cart|mixed $cart
+		 */
+		public static function cart_diag_check( $cart ) {
+			try {
+				self::cart_diag_check_body( $cart );
+			} catch ( Throwable $t ) {
+				self::cart_diag_note_internal_failure( $t );
+			}
+		}
+
+		/**
+		 * Shutdown-time fatal catcher. The sort_by_price() TypeError can
+		 * fire on paths that never run the instrumented hook, so this is
+		 * the guaranteed capture regardless of where corruption entered.
+		 */
+		public static function cart_diag_shutdown_capture() {
+			try {
+				$err = error_get_last();
+				if ( ! is_array( $err ) || ! isset( $err['type'], $err['message'] ) ) {
+					return;
+				}
+				if ( ! in_array( (int) $err['type'], array( E_ERROR, E_RECOVERABLE_ERROR ), true ) ) {
+					return;
+				}
+
+				$cart = null;
+				if ( function_exists( 'WC' ) && is_object( WC() ) && isset( WC()->cart ) && is_object( WC()->cart ) ) {
+					$cart = WC()->cart;
+				}
+
+				self::cart_diag_capture_fatal( $err, $cart );
+			} catch ( Throwable $t ) {
+				self::cart_diag_note_internal_failure( $t );
+			}
+		}
+
+		/**
+		 * Testable core of the shutdown capture: match the cart/discount
+		 * type fatal and dump per-item type data from the in-memory cart.
+		 *
+		 * @param array       $err  error_get_last()-shaped array.
+		 * @param object|null $cart Cart object, if one is available.
+		 * @return bool Whether the fatal matched and was logged.
+		 */
+		public static function cart_diag_capture_fatal( $err, $cart ) {
+			$message = isset( $err['message'] ) ? (string) $err['message'] : '';
+			$file    = isset( $err['file'] ) ? (string) $err['file'] : '';
+
+			if ( false === strpos( $message, 'Unsupported operand types' ) ) {
+				return false;
+			}
+
+			// Only fatals raised from WooCommerce cart/discount internals.
+			$haystack = $file . ' ' . $message;
+			if ( false === stripos( $haystack, 'wc-discounts' )
+				&& false === stripos( $haystack, 'wc-cart' )
+				&& false === stripos( $haystack, 'sort_by_price' )
+				&& false === stripos( $haystack, 'woocommerce' ) ) {
+				return false;
+			}
+
+			$items = array();
+			if ( is_object( $cart ) ) {
+				// Prefer the raw property over get_cart(): no filter chain
+				// runs during shutdown after a fatal.
+				$contents = isset( $cart->cart_contents ) && is_array( $cart->cart_contents ) ? $cart->cart_contents : null;
+				if ( null === $contents && is_callable( array( $cart, 'get_cart' ) ) ) {
+					$contents = $cart->get_cart();
+				}
+				if ( is_array( $contents ) ) {
+					foreach ( $contents as $key => $item ) {
+						if ( ! is_array( $item ) ) {
+							$items[] = array(
+								'cart_key'  => substr( (string) $key, 0, 12 ),
+								'item_type' => gettype( $item ),
+							);
+							continue;
+						}
+						$has_qty = array_key_exists( 'quantity', $item );
+						$qty     = $has_qty ? $item['quantity'] : null;
+						$items[] = array(
+							'cart_key'              => substr( (string) $key, 0, 12 ),
+							'product_id'            => ( isset( $item['product_id'] ) && is_scalar( $item['product_id'] ) ) ? $item['product_id'] : 0,
+							'variation_id'          => ( isset( $item['variation_id'] ) && is_scalar( $item['variation_id'] ) ) ? $item['variation_id'] : 0,
+							'quantity'              => $has_qty ? self::cart_diag_safe_value( $qty ) : '{missing}',
+							'quantity_type'         => $has_qty ? gettype( $qty ) : 'missing',
+							'price'                 => self::cart_diag_safe_value( self::cart_diag_item_price( $item, 'edit' ) ),
+							'discounted_price_type' => array_key_exists( 'discounted_price', $item ) ? gettype( $item['discounted_price'] ) : 'absent',
+						);
+					}
+				}
+			}
+
+			$uri = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '';
+
+			self::log( 'error', array(
+				'event'           => 'cart_fatal_captured',
+				'fatal_message'   => self::truncate( $message, 500 ),
+				'fatal_file'      => self::truncate( $file . ':' . ( isset( $err['line'] ) ? (int) $err['line'] : 0 ), 200 ),
+				'cart_items'      => $items,
+				'applied_coupons' => self::cart_diag_applied_coupons( $cart ),
+				'user_id'         => function_exists( 'get_current_user_id' ) ? get_current_user_id() : 0,
+				'callbacks'       => self::cart_diag_callback_map(),
+				'uri'             => $uri,
+				'context'         => self::detect_context(),
+				'is_admin_ajax'   => self::is_admin_ajax_request( $uri ),
+			) );
+
+			return true;
+		}
+
+		/**
+		 * @param WC_Cart|mixed $cart
+		 */
+		private static function cart_diag_snapshot_body( $cart ) {
+			if ( self::$cart_diag_log_count >= self::CART_DIAG_MAX_LOGS ) {
+				return; // Log budget exhausted — skip the per-item work.
+			}
+
+			// Duck-typed: third-party code occasionally fires this hook
+			// argless, and the diagnostic must not assume WC_Cart exists.
+			if ( ! is_object( $cart ) || ! is_callable( array( $cart, 'get_cart' ) ) ) {
+				return;
+			}
+
+			// Re-entrancy guard: a callback that calls calculate_totals()
+			// mid-hook re-fires this hook nested; overwriting the outer
+			// snapshot with post-corruption values would flip attribution
+			// to 'upstream'. Keep the outer (earliest) snapshot instead.
+			if ( self::$cart_diag_in_progress ) {
+				return;
+			}
+			self::$cart_diag_in_progress = true;
+
+			self::$cart_diag_snapshot = array();
+
+			$items = $cart->get_cart();
+			if ( ! is_array( $items ) ) {
+				return;
+			}
+
+			foreach ( $items as $key => $item ) {
+				if ( ! is_array( $item ) ) {
+					continue; // Non-array item row: recorded as corruption by the check pass.
+				}
+
+				self::$cart_diag_snapshot[ $key ] = array(
+					'quantity'         => array_key_exists( 'quantity', $item ) ? $item['quantity'] : null,
+					// 'edit' context skips the product-price filter chain: no
+					// third-party code runs and no observer effect, while
+					// set_price() writes are still visible. The check pass
+					// reads the filtered 'view' value WC actually consumes.
+					'price'            => self::cart_diag_item_price( $item, 'edit' ),
+					'discounted_price' => array_key_exists( 'discounted_price', $item ) ? $item['discounted_price'] : null,
+					'has_discounted'   => array_key_exists( 'discounted_price', $item ),
+				);
+			}
+		}
+
+		/**
+		 * @param WC_Cart|mixed $cart
+		 */
+		private static function cart_diag_check_body( $cart ) {
+			// The snapshot/check pair completed (or never started); either
+			// way the next firing may take a fresh snapshot.
+			self::$cart_diag_in_progress = false;
+
+			if ( self::$cart_diag_log_count >= self::CART_DIAG_MAX_LOGS ) {
+				return;
+			}
+
+			if ( ! is_object( $cart ) || ! is_callable( array( $cart, 'get_cart' ) ) ) {
+				return;
+			}
+
+			$items = $cart->get_cart();
+			if ( ! is_array( $items ) ) {
+				return;
+			}
+
+			$corrupted = array();
+
+			foreach ( $items as $key => $item ) {
+				$early = isset( self::$cart_diag_snapshot[ $key ] ) ? self::$cart_diag_snapshot[ $key ] : null;
+
+				if ( ! is_array( $item ) ) {
+					// The whole item row was replaced with a non-array value.
+					$corrupted[] = self::cart_diag_entry( 'item', $key, $item, $item, null !== $early, null );
+					continue;
+				}
+
+				// WC 10.8.x: only a non-numeric string quantity can raise the
+				// float/string TypeError in WC_Discounts::sort_by_price() —
+				// price is float-cast upstream. The price/discounted_price
+				// findings below are context, not the fatal's cause.
+				if ( ! array_key_exists( 'quantity', $item ) ) {
+					$row                  = self::cart_diag_entry( 'quantity', $key, $item, null, null !== $early, $early ? $early['quantity'] : null );
+					$row['current_value'] = '{missing}';
+					$row['current_type']  = 'missing';
+					$corrupted[]          = $row;
+				} elseif ( ! is_numeric( $item['quantity'] ) ) {
+					$corrupted[] = self::cart_diag_entry(
+						'quantity',
+						$key,
+						$item,
+						$item['quantity'],
+						null !== $early,
+						$early ? $early['quantity'] : null
+					);
+				}
+
+				// 'view' context: the filtered value WC_Discounts consumes.
+				$price = self::cart_diag_item_price( $item, 'view' );
+				if ( null !== $price && ! is_numeric( $price ) ) {
+					$corrupted[] = self::cart_diag_entry( 'price', $key, $item, $price, null !== $early, $early ? $early['price'] : null );
+				}
+
+				if ( array_key_exists( 'discounted_price', $item ) && null !== $item['discounted_price'] && ! is_numeric( $item['discounted_price'] ) ) {
+					$had_early_field = $early && ! empty( $early['has_discounted'] );
+					$corrupted[]     = self::cart_diag_entry(
+						'discounted_price',
+						$key,
+						$item,
+						$item['discounted_price'],
+						$had_early_field,
+						$had_early_field ? $early['discounted_price'] : null
+					);
+				}
+			}
+
+			if ( empty( $corrupted ) ) {
+				return;
+			}
+
+			// The hook fires several times per request; identical findings
+			// are logged once per process, new findings get their own event
+			// up to CART_DIAG_MAX_LOGS.
+			$sig_parts = array();
+			foreach ( $corrupted as $entry ) {
+				$sig_parts[] = $entry['field'] . '|' . $entry['cart_key'] . '|' . $entry['current_type'] . '|' . $entry['current_value'];
+			}
+			$sig = md5( implode( "\n", $sig_parts ) );
+			if ( isset( self::$cart_diag_logged_sigs[ $sig ] ) ) {
+				return;
+			}
+			self::$cart_diag_logged_sigs[ $sig ] = true;
+			self::$cart_diag_log_count++;
+
+			$uri = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '';
+
+			self::log( 'error', array(
+				'event'           => 'cart_type_corruption',
+				'corrupted'       => $corrupted,
+				'cart_item_count' => count( $items ),
+				'applied_coupons' => self::cart_diag_applied_coupons( $cart ),
+				'user_id'         => function_exists( 'get_current_user_id' ) ? get_current_user_id() : 0,
+				'callbacks'       => self::cart_diag_callback_map(),
+				'uri'             => $uri,
+				'context'         => self::detect_context(),
+				'is_admin_ajax'   => self::is_admin_ajax_request( $uri ),
+			) );
+		}
+
+		/**
+		 * Build one corruption record.
+		 *
+		 * Attribution: 'upstream' = already bad in the snapshot (session,
+		 * add-to-cart, or a filter predating the hook); 'hook_callback' =
+		 * clean at snapshot time, bad now; 'added_during_hook' = the item
+		 * had no snapshot entry (e.g. a BOGO/free-gift callback added it).
+		 *
+		 * @param string $field       Which cart item field is non-numeric.
+		 * @param string $key         Cart item key.
+		 * @param mixed  $item        Cart item row (usually an array).
+		 * @param mixed  $value       The corrupted value.
+		 * @param bool   $has_early   Whether snapshot data exists for the field.
+		 * @param mixed  $early_value Snapshot value for the field.
+		 * @return array
+		 */
+		private static function cart_diag_entry( $field, $key, $item, $value, $has_early, $early_value ) {
+			if ( ! $has_early ) {
+				$origin = 'added_during_hook';
+			} elseif ( is_numeric( $early_value ) ) {
+				$origin = 'hook_callback';
+			} else {
+				$origin = 'upstream';
+			}
+
+			$product_type = '';
+			if ( is_array( $item ) && isset( $item['data'] ) && is_object( $item['data'] ) && is_callable( array( $item['data'], 'get_type' ) ) ) {
+				$type_val     = $item['data']->get_type();
+				$product_type = is_string( $type_val ) ? $type_val : gettype( $type_val );
+			}
+
+			return array(
+				'field'         => $field,
+				'cart_key'      => substr( (string) $key, 0, 12 ),
+				'product_id'    => ( is_array( $item ) && isset( $item['product_id'] ) && is_scalar( $item['product_id'] ) ) ? $item['product_id'] : 0,
+				'variation_id'  => ( is_array( $item ) && isset( $item['variation_id'] ) && is_scalar( $item['variation_id'] ) ) ? $item['variation_id'] : 0,
+				'product_type'  => $product_type,
+				'current_value' => self::cart_diag_safe_value( $value ),
+				'current_type'  => gettype( $value ),
+				'early_value'   => $has_early ? self::cart_diag_safe_value( $early_value ) : null,
+				'early_type'    => $has_early ? gettype( $early_value ) : null,
+				'corrupted_by'  => $origin,
+			);
+		}
+
+		/**
+		 * Read a cart item's product price without letting a broken product
+		 * object or throwing price filter take the diagnostic down.
+		 *
+		 * @param array|mixed $item    Cart item row.
+		 * @param string      $context 'view' (filtered — what WC consumes) or 'edit' (raw prop).
+		 * @return mixed Null when no readable product object is present; a
+		 *               '{get_price threw …}' marker when the read throws
+		 *               (itself diagnostic signal — non-numeric, so flagged).
+		 */
+		private static function cart_diag_item_price( $item, $context ) {
+			if ( ! is_array( $item ) || ! isset( $item['data'] ) || ! is_object( $item['data'] ) || ! is_callable( array( $item['data'], 'get_price' ) ) ) {
+				return null;
+			}
+			try {
+				return $item['data']->get_price( $context );
+			} catch ( Throwable $t ) {
+				return '{get_price threw ' . get_class( $t ) . '}';
+			}
+		}
+
+		/**
+		 * Render any value as a short, log-safe string. A bare (string)
+		 * cast fatals on objects without __toString — exactly the malformed
+		 * shapes this diagnostic exists to record — so never cast blindly.
+		 *
+		 * @param mixed $value
+		 * @return string
+		 */
+		private static function cart_diag_safe_value( $value ) {
+			if ( null === $value ) {
+				return '{null}';
+			}
+			if ( is_bool( $value ) ) {
+				return $value ? '{true}' : '{false}';
+			}
+			if ( is_scalar( $value ) ) {
+				return self::truncate( (string) $value, 80 );
+			}
+			if ( is_object( $value ) ) {
+				return '{object:' . get_class( $value ) . '}';
+			}
+			if ( is_array( $value ) ) {
+				return self::truncate( '{array:' . self::encode_log_payload( $value ) . '}', 80 );
+			}
+			return '{' . gettype( $value ) . '}';
+		}
+
+		/**
+		 * Applied coupon codes, capped and rendered log-safe. The
+		 * sort_by_price() fatal only occurs while a coupon is being
+		 * applied, so the coupon list is primary reproduction context.
+		 *
+		 * @param object|mixed $cart
+		 * @return string[]
+		 */
+		private static function cart_diag_applied_coupons( $cart ) {
+			if ( ! is_object( $cart ) || ! is_callable( array( $cart, 'get_applied_coupons' ) ) ) {
+				return array();
+			}
+			try {
+				$coupons = $cart->get_applied_coupons();
+			} catch ( Throwable $t ) {
+				return array( '{get_applied_coupons threw ' . get_class( $t ) . '}' );
+			}
+			if ( ! is_array( $coupons ) ) {
+				return array();
+			}
+			$out = array();
+			foreach ( array_slice( $coupons, 0, 20 ) as $code ) {
+				$out[] = self::cart_diag_safe_value( $code );
+			}
+			return $out;
+		}
+
+		/**
+		 * Callback lists for every hook through which cart item values can
+		 * be written or rewritten. 'upstream' corruption typically enters
+		 * via the session/product filters, not the totals hook itself.
+		 *
+		 * @return array<string, string[]>
+		 */
+		private static function cart_diag_callback_map() {
+			$hooks = array(
+				'woocommerce_before_calculate_totals',
+				'woocommerce_get_cart_item_from_session',
+				'woocommerce_get_cart_contents',
+				'woocommerce_add_cart_item',
+				'woocommerce_product_get_price',
+				'woocommerce_product_variation_get_price',
+			);
+
+			$map = array();
+			foreach ( $hooks as $hook_name ) {
+				$callbacks = self::enumerate_hook_callbacks( $hook_name );
+				if ( ! empty( $callbacks ) ) {
+					$map[ $hook_name ] = $callbacks;
+				}
+			}
+			return $map;
+		}
+
+		/**
+		 * Record (once per process) that the diagnostic itself failed. The
+		 * diagnostic must never take down the cart it is observing, so all
+		 * entry points swallow Throwables and leave a single breadcrumb.
+		 * Deliberately bypasses self::log() in case log() is implicated.
+		 *
+		 * @param Throwable $t
+		 */
+		private static function cart_diag_note_internal_failure( $t ) {
+			static $noted = false;
+			if ( $noted ) {
+				return;
+			}
+			$noted = true;
+			error_log( '[hypercart_query_guard][error] cart_diag internal failure: ' . get_class( $t ) . ': ' . $t->getMessage() );
+		}
+
+		/**
+		 * List all registered callbacks for a hook, with priorities.
+		 *
+		 * @param string $hook_name
+		 * @return string[]  e.g. ['10:my_function', '30:MyClass::method']
+		 */
+		private static function enumerate_hook_callbacks( $hook_name ) {
+			global $wp_filter;
+
+			// isset() on the property is false for pre-4.7-style plain-array
+			// rows as well as missing hooks — both return empty safely.
+			if ( ! isset( $wp_filter[ $hook_name ]->callbacks ) || ! is_array( $wp_filter[ $hook_name ]->callbacks ) ) {
+				return array();
+			}
+
+			$list = array();
+			foreach ( $wp_filter[ $hook_name ]->callbacks as $priority => $hooks ) {
+				if ( ! is_array( $hooks ) ) {
+					continue;
+				}
+				foreach ( $hooks as $hook ) {
+					$fn = isset( $hook['function'] ) ? $hook['function'] : null;
+					if ( is_string( $fn ) ) {
+						$name = $fn;
+					} elseif ( is_array( $fn ) ) {
+						$cls  = isset( $fn[0] ) ? ( is_object( $fn[0] ) ? get_class( $fn[0] ) : ( is_string( $fn[0] ) ? $fn[0] : gettype( $fn[0] ) ) ) : '?';
+						$mth  = ( isset( $fn[1] ) && is_string( $fn[1] ) ) ? $fn[1] : '?';
+						$name = $cls . '::' . $mth;
+					} elseif ( $fn instanceof Closure ) {
+						try {
+							$ref  = new ReflectionFunction( $fn );
+							$file = $ref->getFileName();
+							// getFileName() is false for closures over internal
+							// functions (first-class callable syntax).
+							$name = $file ? '{closure@' . basename( $file ) . ':' . (int) $ref->getStartLine() . '}' : '{closure:internal}';
+						} catch ( ReflectionException $e ) {
+							$name = '{closure}';
+						}
+					} elseif ( is_object( $fn ) ) {
+						$name = '{invokable:' . get_class( $fn ) . '}';
+					} else {
+						$name = '{unknown:' . gettype( $fn ) . '}';
+					}
+					$list[] = $priority . ':' . $name;
+				}
+			}
+
+			// Keep individual log entries bounded on hook-heavy sites.
+			if ( count( $list ) > 60 ) {
+				$extra = count( $list ) - 60;
+				$list  = array_slice( $list, 0, 60 );
+				$list[] = '+' . $extra . ' more';
+			}
+
+			return $list;
 		}
 
 		/**
