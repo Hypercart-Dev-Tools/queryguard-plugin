@@ -37,6 +37,10 @@
  *                    entry points swallow Throwables — the tracer can
  *                    never take down the cart it observes. Log volume is
  *                    capped per process with per-signature de-duplication.
+ *                    Enable to reproduce, then disable: while enabled it
+ *                    adds one filtered get_price() read per cart item per
+ *                    totals calculation (the scan runs even on clean
+ *                    carts), so it is not intended to stay on permanently.
  *
  * @package Hypercart
  */
@@ -1392,11 +1396,28 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		 * Testable core of the shutdown capture: match the cart/discount
 		 * type fatal and dump per-item type data from the in-memory cart.
 		 *
+		 * Public for testability, and self-guarded like the other entry
+		 * points — it never throws, no matter who calls it.
+		 *
 		 * @param array       $err  error_get_last()-shaped array.
 		 * @param object|null $cart Cart object, if one is available.
 		 * @return bool Whether the fatal matched and was logged.
 		 */
 		public static function cart_diag_capture_fatal( $err, $cart ) {
+			try {
+				return self::cart_diag_capture_fatal_body( $err, $cart );
+			} catch ( Throwable $t ) {
+				self::cart_diag_note_internal_failure( $t );
+				return false;
+			}
+		}
+
+		/**
+		 * @param array       $err  error_get_last()-shaped array.
+		 * @param object|null $cart Cart object, if one is available.
+		 * @return bool Whether the fatal matched and was logged.
+		 */
+		private static function cart_diag_capture_fatal_body( $err, $cart ) {
 			$message = isset( $err['message'] ) ? (string) $err['message'] : '';
 			$file    = isset( $err['file'] ) ? (string) $err['file'] : '';
 
@@ -1564,6 +1585,11 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				}
 
 				// 'view' context: the filtered value WC_Discounts consumes.
+				// NOTE: the snapshot stored the raw 'edit' value, so on price
+				// rows early_value/current_value mix contexts: a view-only
+				// filter corruption reads as 'hook_callback' even if that
+				// filter predates the hook. Treat corrupted_by on price rows
+				// as a hint — quantity rows carry the authoritative signal.
 				$price = self::cart_diag_item_price( $item, 'view' );
 				if ( null !== $price && ! is_numeric( $price ) ) {
 					$corrupted[] = self::cart_diag_entry( 'price', $key, $item, $price, null !== $early, $early ? $early['price'] : null );
