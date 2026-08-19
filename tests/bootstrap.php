@@ -18,6 +18,9 @@ if ( ! defined( 'HYPERCART_QUERY_GUARD_MODE' ) ) {
 if ( ! defined( 'HYPERCART_QUERY_GUARD_THROTTLE_MODE' ) ) {
 	define( 'HYPERCART_QUERY_GUARD_THROTTLE_MODE', 'off' );
 }
+if ( ! defined( 'SAVEQUERIES' ) ) {
+	define( 'SAVEQUERIES', true );
+}
 
 final class WP_Stub_State {
 	/** @var array<string,array<int,callable>> */
@@ -237,9 +240,11 @@ if ( ! function_exists( 'add_action' ) ) {
 	}
 }
 
+$GLOBALS['_qg_last_encoded'] = null;
 if ( ! function_exists( 'wp_json_encode' ) ) {
-	function wp_json_encode( $data ) {
-		return json_encode( $data );
+	function wp_json_encode( $data, $options = 0, $depth = 512 ) {
+		$GLOBALS['_qg_last_encoded'] = $data;
+		return json_encode( $data, $options, $depth );
 	}
 }
 
@@ -251,19 +256,19 @@ if ( ! function_exists( 'did_action' ) ) {
 
 if ( ! function_exists( 'wp_doing_cron' ) ) {
 	function wp_doing_cron() {
-		return false;
+		return defined( 'DOING_CRON' ) && DOING_CRON;
 	}
 }
 
 if ( ! function_exists( 'wp_doing_ajax' ) ) {
 	function wp_doing_ajax() {
-		return false;
+		return defined( 'DOING_AJAX' ) && DOING_AJAX;
 	}
 }
 
 if ( ! function_exists( 'is_admin' ) ) {
 	function is_admin() {
-		return false;
+		return defined( 'WP_ADMIN' ) && WP_ADMIN;
 	}
 }
 
@@ -301,6 +306,34 @@ if ( ! function_exists( 'esc_html__' ) ) {
 	function esc_html__( $text, $domain = 'default' ) {
 		return esc_html( $text );
 	}
+}
+
+if ( ! function_exists( '__' ) ) {
+	function __( $text, $domain = 'default' ) {
+		return $text;
+	}
+}
+
+if ( ! function_exists( 'set_transient' ) ) {
+	function set_transient( $key, $value, $expiration = 0 ) {
+		return true;
+	}
+}
+
+if ( ! function_exists( 'get_transient' ) ) {
+	function get_transient( $key ) {
+		return false;
+	}
+}
+
+if ( ! function_exists( 'delete_transient' ) ) {
+	function delete_transient( $key ) {
+		return true;
+	}
+}
+
+function remove_all_filters( $hook ) {
+	WP_Stub_State::$filters[ $hook ] = array();
 }
 
 /**
