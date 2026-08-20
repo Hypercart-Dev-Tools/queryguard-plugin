@@ -7,7 +7,7 @@
  * hook callback enumeration, and the shutdown fatal capture — all against
  * the stub bootstrap. Integration gaps (real WC_Cart objects, live hook
  * dispatch ordering, the actual shutdown sequence) are exercised manually
- * on the Local site; see CHANGELOG 1.2.0.
+ * on the Local site; see CHANGELOG 1.3.0.
  *
  * @package Hypercart
  */

@@ -3,7 +3,7 @@
  * Plugin Name:       Hypercart Query Guard
  * Plugin URI:        https://hypercart.io
  * Description:       PHP-side circuit breaker that enforces MySQL MAX_EXECUTION_TIME on read queries to prevent runaway SELECTs from saturating the pod. Tiered limits per request context, observe-mode for safe rollout, automatic re-application on connection rotation, and admin-search timeout fallback.
- * Version:           1.2.0
+ * Version:           1.3.0
  * Author:            Hypercart / Neochrome
  * License:           GPL-2.0-or-later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
@@ -18,6 +18,11 @@
  * AS throttle:       define( 'HYPERCART_QUERY_GUARD_THROTTLE_MODE', 'test_observe' );
  *                    Modes: 'off' | 'test_observe' | 'observe' | 'enforce'
  *                    (default: 'off')
+ *
+ * Order-notes probe: define( 'HYPERCART_QUERY_GUARD_LOG_ORDER_NOTES', true );
+ *                    Diagnostic. Logs a backtrace for unscoped
+ *                    wc_get_order_notes() loads (the order-notes mega-query)
+ *                    to identify the calling code. Off by default.
  *
  * v2 drop-in:        Optional wp-content/db.php applies SET SESSION at
  *                    connection time and conditionally backtraces slow
@@ -91,6 +96,21 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		const THROTTLE_LEVEL_NORMAL   = 'normal';
 		const THROTTLE_LEVEL_ELEVATED = 'elevated';
 		const THROTTLE_LEVEL_CRITICAL = 'critical';
+
+		/**
+		 * Max unscoped order-note diagnostic log lines per request. Volume
+		 * guard for the optional order-notes caller probe — the unscoped
+		 * load normally fires once per request, but a looping caller is
+		 * capped here so it can never flood the log.
+		 */
+		const ORDER_NOTES_LOG_MAX_PER_REQUEST = 5;
+
+		/**
+		 * Count of order-note diagnostic lines emitted this request.
+		 *
+		 * @var int
+		 */
+		private static $order_notes_log_count = 0;
 
 		/**
 		 * Default throttle policy by load level.
@@ -268,6 +288,14 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 			$mode          = self::get_mode();
 			$throttle_mode = self::get_throttle_mode();
 
+			// Optional diagnostic, independent of mode/throttle: log the PHP
+			// caller of the unscoped "order-notes mega-query". Registered
+			// before the early-return so it works even when the guard is
+			// otherwise off. Disabled unless explicitly enabled in wp-config.
+			if ( self::order_notes_probe_enabled() ) {
+				add_action( 'pre_get_comments', array( __CLASS__, 'log_unscoped_order_notes' ), 1 );
+			}
+
 			if ( self::MODE_OFF === $mode && self::THROTTLE_MODE_OFF === $throttle_mode ) {
 				return;
 			}
@@ -323,6 +351,92 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 			}
 			global $wpdb;
 			$wpdb->query( 'SELECT SLEEP(6)' );
+		}
+
+		/**
+		 * Whether the unscoped order-note caller probe is enabled.
+		 *
+		 * Off unless define( 'HYPERCART_QUERY_GUARD_LOG_ORDER_NOTES', true )
+		 * is set in wp-config.php. Also overridable via the
+		 * 'hypercart_query_guard_log_order_notes' filter.
+		 *
+		 * @return bool
+		 */
+		private static function order_notes_probe_enabled() {
+			$enabled = defined( 'HYPERCART_QUERY_GUARD_LOG_ORDER_NOTES' ) && HYPERCART_QUERY_GUARD_LOG_ORDER_NOTES;
+
+			return (bool) apply_filters( 'hypercart_query_guard_log_order_notes', $enabled );
+		}
+
+		/**
+		 * Diagnostic probe for the "order-notes mega-query".
+		 *
+		 * WooCommerce's wc_get_order_notes() maps order_id => post_id and then
+		 * calls get_comments() with type 'order_note' and no LIMIT. When a
+		 * caller invokes it with no order_id / order__in, the query is
+		 * unscoped: WordPress gathers the IDs of every order note on the site
+		 * and primes the comment cache in one giant
+		 * `SELECT wp_comments.* FROM wp_comments WHERE comment_ID IN (...)`,
+		 * scanning ~9M rows and growing without bound.
+		 *
+		 * The slow-query log only records the immediate caller
+		 * (wc-order-functions.php), not who called it unscoped. This fires on
+		 * pre_get_comments — before the expensive query runs — and records a
+		 * full backtrace so the originating caller can be identified.
+		 *
+		 * Scoped per-order loads (the normal, cheap case) are ignored, so this
+		 * logs only the problematic unscoped call. Enabled only when
+		 * HYPERCART_QUERY_GUARD_LOG_ORDER_NOTES is truthy.
+		 *
+		 * @param WP_Comment_Query $query Comment query (passed by reference; not modified).
+		 * @return void
+		 */
+		public static function log_unscoped_order_notes( $query ) {
+			if ( ! is_object( $query ) || empty( $query->query_vars ) ) {
+				return;
+			}
+
+			$vars = $query->query_vars;
+
+			// WooCommerce order notes only.
+			if ( ! isset( $vars['type'] ) || 'order_note' !== $vars['type'] ) {
+				return;
+			}
+
+			// Scoped per-order loads are cheap and expected. Only the unscoped
+			// "load every note" call is the performance problem.
+			if ( ! empty( $vars['post_id'] ) || ! empty( $vars['post__in'] ) ) {
+				return;
+			}
+
+			// Bound per-request volume in case a caller loops.
+			if ( self::$order_notes_log_count >= self::ORDER_NOTES_LOG_MAX_PER_REQUEST ) {
+				return;
+			}
+			self::$order_notes_log_count++;
+
+			// Caller chain. Skip this handler and the hook-dispatch frames so
+			// get_comments() -> wc_get_order_notes() -> originating caller
+			// surface at the front of the trace.
+			$trace = function_exists( 'wp_debug_backtrace_summary' )
+				? wp_debug_backtrace_summary( null, 3, false )
+				: array();
+			if ( is_array( $trace ) ) {
+				$trace = implode( ' < ', $trace );
+			}
+
+			self::log(
+				'warn',
+				array(
+					'event'   => 'order_notes_unscoped',
+					'context' => self::detect_context(),
+					'action'  => isset( $_REQUEST['action'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['action'] ) ) : '',
+					'uri'     => isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '',
+					'referer' => isset( $_SERVER['HTTP_REFERER'] ) ? sanitize_text_field( wp_unslash( $_SERVER['HTTP_REFERER'] ) ) : '',
+					'limit'   => isset( $vars['number'] ) ? (int) $vars['number'] : 0,
+					'caller'  => self::truncate( (string) $trace, 1200 ),
+				)
+			);
 		}
 
 		/**

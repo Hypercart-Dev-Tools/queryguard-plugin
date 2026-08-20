@@ -31,10 +31,12 @@ class HCQG_DB extends wpdb {
 
 	const DROPIN_VERSION = '2.0.0';
 
-	// Tested against WordPress 5.5 – 6.8. The override relies on query()
-	// returning int|bool and _do_query() being private (not called through
-	// the vtable). If core refactors _do_query into a protected method or
-	// changes query()'s signature, the assertion below will fire.
+	// Tested against WordPress 5.5 – 7.0 (all 7.0.x patch releases). The
+	// override relies on query() returning int|bool and _do_query() being
+	// private (not called through the vtable). If core refactors _do_query
+	// into a protected method or changes query()'s signature, the warning
+	// below will fire. Comparison is on MAJOR.MINOR, so patch releases within
+	// the tested line (e.g. 7.0.2) are treated as in-range.
 	const WP_VERSION_FLOOR   = '5.5';
 	const WP_VERSION_CEILING = '7.0';
 
@@ -54,6 +56,9 @@ class HCQG_DB extends wpdb {
 
 	/** @var bool Whether the first-query SET SESSION has been applied. */
 	private $hcqg_session_applied = false;
+
+	/** @var bool Whether the version-range warning has already been emitted this process. */
+	private static $hcqg_version_warned = false;
 
 	/** @var mixed Connection identity for reconnect / rotation detection. */
 	private $hcqg_last_dbh = null;
@@ -101,17 +106,28 @@ class HCQG_DB extends wpdb {
 	}
 
 	/**
-	 * Log a notice if WordPress version is outside the tested range.
+	 * Log a notice, at most once per process, if the WordPress version is
+	 * outside the tested range.
+	 *
+	 * The comparison is done on MAJOR.MINOR so that patch releases within the
+	 * tested line (e.g. 7.0.2 against a 7.0 ceiling) are treated as in-range
+	 * and do not fire the warning on every request. Skipped entirely in 'off'
+	 * mode, and de-duplicated per process via a static guard.
 	 */
 	private function hcqg_version_check() {
 		global $wp_version;
 
-		if ( ! isset( $wp_version ) ) {
+		if ( ! $this->hcqg_active || self::$hcqg_version_warned || ! isset( $wp_version ) ) {
 			return;
 		}
 
-		if ( version_compare( $wp_version, self::WP_VERSION_FLOOR, '<' ) ||
-			version_compare( $wp_version, self::WP_VERSION_CEILING, '>' ) ) {
+		// Reduce to MAJOR.MINOR: patch releases inside the tested line are in-range.
+		$parts = explode( '.', preg_replace( '/[^0-9.].*$/', '', (string) $wp_version ) );
+		$major_minor = implode( '.', array_slice( array_pad( $parts, 2, '0' ), 0, 2 ) );
+
+		if ( version_compare( $major_minor, self::WP_VERSION_FLOOR, '<' ) ||
+			version_compare( $major_minor, self::WP_VERSION_CEILING, '>' ) ) {
+			self::$hcqg_version_warned = true;
 			error_log( sprintf(
 				'[hypercart_query_guard][warn] db.php drop-in tested on WP %s–%s; running %s. '
 				. 'Verify wpdb::query() override compatibility.',
