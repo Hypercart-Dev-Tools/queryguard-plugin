@@ -98,6 +98,23 @@ Throttle policy defaults:
 | Elevated | 5 | 15s | 1 |
 | Critical | 1 | 10s | 1 |
 
+### Cart type diagnostic
+
+Opt-in tracer for the cart/checkout fatal `TypeError: Unsupported operand types: float / string` in `WC_Discounts::sort_by_price()`. Enable with:
+
+```php
+define( 'HYPERCART_CART_TYPE_DIAGNOSTIC', true );
+```
+
+(or override at runtime via the `hypercart_cart_type_diagnostic_enabled` filter from wp-config or an earlier-loading mu-plugin). It emits two error-level events:
+
+- **`cart_type_corruption`** — a snapshot/re-check pair around `woocommerce_before_calculate_totals` reports every non-numeric cart item `quantity` / `price` / `discounted_price` with origin attribution (`upstream` / `hook_callback` / `added_during_hook`), applied coupons, and callback lists for the hooks able to write cart item values.
+- **`cart_fatal_captured`** — a shutdown-time catcher that matches the TypeError itself (on any code path, including `WC_Cart::apply_coupon()` validation, which never fires the totals hook) and dumps per-item quantity/price types from the in-memory cart.
+
+The diagnostic never throws — all entry points swallow `Throwable` — and log volume is capped at 5 corruption events per PHP process with de-duplication across repeat hook firings. Note: in WooCommerce 10.8.x only a non-numeric string **quantity** can raise this fatal (price is float-cast upstream), so `quantity` findings are the authoritative signal; price findings are context. On `price` rows, `early_value` is the raw (edit-context) price while `current_value` is the filtered (view-context) value, so `corrupted_by` on price rows is a hint, not proof.
+
+**Enable to reproduce, then disable.** The corruption scan runs on every `woocommerce_before_calculate_totals` firing even when the cart is clean, adding one filtered `get_price()` read per cart item per totals calculation. That is mild next to what a totals calculation already costs, but it is not zero — the diagnostic is an investigation tool, not a permanent fixture.
+
 Throttle tuning filters:
 
 ```php

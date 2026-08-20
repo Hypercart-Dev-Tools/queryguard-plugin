@@ -4,6 +4,18 @@ All notable changes to Hypercart Query Guard are documented here.
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Every merged build carries a version number.
 
+## [1.3.0] — 2026-07-02
+
+### Added
+
+- **Cart type diagnostic (`HYPERCART_CART_TYPE_DIAGNOSTIC`).** Opt-in tracing for the production cart/checkout fatal `TypeError: Unsupported operand types: float / string` in `WC_Discounts::sort_by_price()` (universal-child-theme issue #888). In WooCommerce 10.8.x only a non-numeric string `quantity` can raise this fatal — price is float-cast upstream — so quantity findings are the authoritative signal. Two new error-level events:
+  - **`cart_type_corruption`** — snapshots cart item `quantity` / `price` / `discounted_price` at `woocommerce_before_calculate_totals` priority `PHP_INT_MIN` and re-checks at `PHP_INT_MAX`. Each non-numeric value is reported with a type-safe rendering (objects/arrays never string-cast), origin attribution (`upstream` = bad before the hook ran, `hook_callback` = corrupted by a hook callback, `added_during_hook` = item added mid-hook, e.g. BOGO free gifts), applied coupon codes, user id, cart item count, request context, and callback lists for the six hooks able to write cart item values (including `woocommerce_get_cart_item_from_session` and the product price filters).
+  - **`cart_fatal_captured`** — a `register_shutdown_function` catcher that matches the TypeError itself and dumps per-item quantity/price types from the in-memory cart. This is the guaranteed capture: `WC_Cart::apply_coupon()` validates via `new WC_Discounts( WC()->cart )` *before* any totals calculation, a path that never fires the instrumented hook.
+  - Safety: every diagnostic entry point swallows `Throwable` — the tracer can never take down the cart it observes. Log volume is capped at 5 corruption events per PHP process (`CART_DIAG_MAX_LOGS`) with signature de-duplication across repeat hook firings, so multi-cart Action Scheduler processes can still report several distinct findings without flooding.
+  - Gating: the wp-config constant plus a `hypercart_cart_type_diagnostic_enabled` filter override (register from wp-config or an earlier-loading mu-plugin).
+
+- **`tests/CartDiagTest.php`.** 19 tests covering classification and attribution, malformed value shapes (object/array/missing/non-array rows, throwing price reads), the log budget and de-duplication, hook callback enumeration (named/array/closure/invokable, pre-4.7 plain-array rows), and shutdown fatal capture. Integration gaps (real `WC_Cart`, live hook dispatch, actual shutdown sequence) are exercised manually on the Local site.
+
 ## [1.2.0] — 2026-06-17
 
 ### Added
