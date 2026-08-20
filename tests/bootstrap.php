@@ -347,7 +347,7 @@ class Hypercart_Logger {
 	public static function reset(): void { self::$calls = array(); }
 	public static function error( $channel, $payload ) { self::$calls[] = array( 'level' => 'error', 'channel' => $channel, 'payload' => $payload ); }
 	public static function info( $channel, $payload ) { self::$calls[] = array( 'level' => 'info', 'channel' => $channel, 'payload' => $payload ); }
-	public static function warn( $channel, $payload ) { self::$calls[] = array( 'level' => 'warn', 'channel' => $channel, 'payload' => $payload ); }
+	public static function warning( $channel, $payload ) { self::$calls[] = array( 'level' => 'warning', 'channel' => $channel, 'payload' => $payload ); }
 }
 
 $GLOBALS['wpdb'] = new WP_Stub_DB();

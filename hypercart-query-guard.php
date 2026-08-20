@@ -1977,8 +1977,8 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 		}
 
 		/**
-		 * Centralized log emitter. Prefers Hypercart_Logger if present (your
-		 * existing file-based logger from the Performance Monitor plugin),
+		 * Centralized log emitter. Prefers Hypercart_Logger if present (the
+		 * file-based logger provided by the Hypercart Helper plugin),
 		 * falls back to error_log so this MU-plugin works standalone.
 		 *
 		 * @param string $level   'info' | 'warn' | 'error'
@@ -1998,6 +1998,12 @@ if ( ! class_exists( 'Hypercart_Query_Guard' ) ) {
 				}
 				if ( 'info' === $level && method_exists( 'Hypercart_Logger', 'info' ) ) {
 					Hypercart_Logger::info( 'query_guard', self::get_logger_payload_for_method( 'Hypercart_Logger', 'info', $payload, $message ) );
+					return;
+				}
+				// The Hypercart Helper logger exposes warning(); older/string-only
+				// loggers may expose warn(). Prefer warning(), fall back to warn().
+				if ( method_exists( 'Hypercart_Logger', 'warning' ) ) {
+					Hypercart_Logger::warning( 'query_guard', self::get_logger_payload_for_method( 'Hypercart_Logger', 'warning', $payload, $message ) );
 					return;
 				}
 				if ( method_exists( 'Hypercart_Logger', 'warn' ) ) {
